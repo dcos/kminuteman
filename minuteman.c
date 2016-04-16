@@ -35,9 +35,9 @@ struct vip {
   struct hlist_node   hash_list;
   struct list_head    backend_containers;
   struct sockaddr_in  vip;
-  struct rcu_head     rcu;
 };
 struct backend {
+  atomic_t            refcnt;
   struct  hlist_node  hash_list;
   struct  sockaddr_in backend;
   bool    available;
@@ -45,7 +45,6 @@ struct backend {
 struct backend_container {
   struct list_head  list;
   struct backend    *backend;
-  struct rcu_head   rcu;
 };
 
 static struct genl_family minuteman_family = {
@@ -58,9 +57,34 @@ static struct genl_family minuteman_family = {
 
 static int hash_sockaddr(struct sockaddr_in *addr) {
   // We don't support not AF_INET
+  // Also, this only works because of the way the struct is laid out
+  // TODO: We should probably make this better
   return jhash(addr, sizeof(addr->sin_family) + sizeof(addr->sin_port) + sizeof(addr->sin_addr), SEED);
 }
-
+static struct vip* get_vip(struct sockaddr_in *addr) {
+  struct vip *v;
+  int hash;
+  hash = hash_sockaddr(addr);
+  hash_for_each_possible_rcu(vip_table, v, hash_list, hash) {
+    if(v->vip.sin_family == addr->sin_family &&
+      v->vip.sin_addr.s_addr == addr->sin_addr.s_addr &&
+      v->vip.sin_port == addr->sin_port) {
+      return v;
+    }
+  }
+  return NULL;
+}
+static struct backend* get_be(struct sockaddr_in *addr) {
+  struct backend *b;
+  int hash;
+  hash = hash_sockaddr(addr);
+  hash_for_each_possible_rcu(be_table, b, hash_list, hash) {
+    if(b->backend.sin_family == addr->sin_family && b->backend.sin_addr.s_addr == addr->sin_addr.s_addr && b->backend.sin_port == addr->sin_port) {
+      return b;
+    }
+  }
+  return NULL;
+}
 static int prepare_reply(struct genl_info *info, u8 cmd, struct sk_buff **skbp) {
         struct sk_buff *skb;
         void *reply;
@@ -106,10 +130,18 @@ static int minuteman_nl_cmd_noop(struct sk_buff *skb, struct genl_info *info) {
   int err;
   struct vip *v;
   int bkt;
+  struct backend_container *be_container;
+  struct backend *be;
 
+  rcu_read_lock();
   hash_for_each_rcu(vip_table, bkt, v, hash_list) {
-    printk(KERN_INFO "Backend: %pISpc\n", &v->vip);
+    printk(KERN_INFO "VIP: %pISpc\n", &v->vip);
+    list_for_each_entry_rcu(be_container, &v->backend_containers, list) {
+      be = rcu_dereference(be_container->backend);
+      printk(KERN_INFO "\tBackend: %pISpc\n", &be->backend);
+    }
   }
+  rcu_read_unlock();
   printk(KERN_INFO "NOOPING\n");
 
   msg = nlmsg_new(NLMSG_DEFAULT_SIZE, GFP_KERNEL);
@@ -153,11 +185,9 @@ static int minuteman_nl_cmd_add_vip(struct sk_buff *skb, struct genl_info *info)
   hash = hash_sockaddr(&addr);
   // No need to RCU read lock here because we're the only ones writing
   // Check that we don't already have this VIP
-  hash_for_each_possible_rcu(vip_table, v, hash_list, hash) {
-    if(v->vip.sin_family == AF_INET && v->vip.sin_addr.s_addr == ip && v->vip.sin_port == port) {
-      rc = -EINVAL;
-      goto fail;
-    }
+  if (get_vip(&addr)) {
+    rc = -EINVAL;
+    goto fail;
   }
 
   v = kmalloc(sizeof(*v), GFP_KERNEL);
@@ -185,12 +215,100 @@ static int minuteman_nl_cmd_del_vip(struct sk_buff *skb, struct genl_info *info)
 static int minuteman_nl_cmd_set_be(struct sk_buff *skb, struct genl_info *info) {
 }
 static int minuteman_nl_cmd_add_be(struct sk_buff *skb, struct genl_info *info) {
-  hash_for_each_possible_rcu(vip_table, v, hash_list, hash) {
-    if(v->vip.sin_family == AF_INET && v->vip.sin_addr.s_addr == ip && v->vip.sin_port == port) {
-      rc = -EINVAL;
+  int rc = 0;
+  struct sk_buff *reply_skb;
+  struct vip *v;
+  struct backend *be, *maybe_be;
+  struct backend_container *be_container;
+  int hash;
+  struct sockaddr_in be_addr, vip_addr;
+
+  if (!info) return -EINVAL;
+  if (!(info->attrs[MINUTEMAN_ATTR_VIP_IP])) {
+    return -EINVAL;
+  }
+  if (!(info->attrs[MINUTEMAN_ATTR_VIP_PORT])) {
+    return -EINVAL;
+  }
+  if (!(info->attrs[MINUTEMAN_ATTR_BE_IP])) {
+    return -EINVAL;
+  }
+  if (!(info->attrs[MINUTEMAN_ATTR_BE_PORT])) {
+    return -EINVAL;
+  }
+
+  vip_addr.sin_family = AF_INET;
+  vip_addr.sin_addr.s_addr = nla_get_u32(info->attrs[MINUTEMAN_ATTR_VIP_IP]);
+  vip_addr.sin_port = nla_get_u16(info->attrs[MINUTEMAN_ATTR_VIP_PORT]);
+
+  be_addr.sin_family = AF_INET;
+  be_addr.sin_addr.s_addr = nla_get_u32(info->attrs[MINUTEMAN_ATTR_BE_IP]);
+  be_addr.sin_port = nla_get_u16(info->attrs[MINUTEMAN_ATTR_BE_PORT]);
+
+  rcu_read_lock();
+  v = get_vip(&vip_addr);
+  if (!v) {
+    rc = -EINVAL;
+    goto fail;
+  }
+  // Now we check if the BE already exists
+  be = get_be(&be_addr);
+  if (be) {
+    // First check if the BE is already in the VIP
+    list_for_each_entry_rcu(be_container, &v->backend_containers, list) {
+      maybe_be = rcu_dereference(be_container->backend);
+      if (maybe_be == be) {
+        rc = -EINVAL;
+        goto fail;
+      }
+    }
+    be_container = kmalloc(sizeof(*be_container), GFP_KERNEL);
+    if (!be_container) {
+      rc = -ENOMEM;
       goto fail;
     }
+    rcu_read_unlock();
+    synchronize_rcu();
+    atomic_inc(&be->refcnt);
+  } else {
+    be_container = kmalloc(sizeof(*be_container), GFP_KERNEL);
+    if (!be_container) {
+      rc = -ENOMEM;
+      goto fail;
+    }
+
+    be = kmalloc(sizeof(*be), GFP_KERNEL);
+    if (!be) {
+      kfree(be_container);
+      rc = -ENOMEM;
+      goto fail;
+    }
+    rcu_read_unlock();
+
+    memcpy(&be->backend, &be_addr, sizeof(be_addr));
+    atomic_set(&be->refcnt, 1);
+    be->available = false;
+
+    hash = hash_sockaddr(&be_addr);
+    synchronize_rcu();
+    hash_add_rcu(be_table, &be->hash_list, hash);
   }
+
+  be_container->backend = be;
+  // We don't need to lock around this because all netlink operations are serialized
+  list_add_rcu(&be_container->list, &v->backend_containers);
+
+  rc = prepare_reply(info, MINUTEMAN_CMD_ADD_BE, &reply_skb);
+  if (rc < 0)
+    return rc;
+
+  rc = send_reply(reply_skb, info);
+
+  return rc;
+
+  fail:
+  rcu_read_unlock();
+  return rc;
 }
 static int minuteman_nl_cmd_del_be(struct sk_buff *skb, struct genl_info *info) {
 }
@@ -247,15 +365,31 @@ static int minuteman_nl_unsetup(void) {
 
 
 
-/* For each probe you need to allocate a kprobe structure */
-static struct kprobe kp = {
-  .symbol_name  = "tcp_init_sock",
-};
-
 /* kprobe pre_handler: called just before the probed instruction is executed */
 static int handler_pre(struct kprobe *p, struct pt_regs *regs)
 {
+  struct socket *sock;
+  struct sockaddr *uaddr;
+  struct sockaddr_in *addr_in;
+  struct vip *v;
+  int addr_len;
+
+  sock = (struct socket*) regs->di;
+  uaddr = (struct sockaddr*) regs->si;
+  addr_len = (int)regs->dx;
+
+  rcu_read_lock();
+  if (uaddr->sa_family == AF_INET) {
+    addr_in = (struct sockaddr_in*)uaddr;
+    v = get_vip(addr_in);
+    if (v) {
+      printk(KERN_INFO "Raver\n");
+    }
+  }
+  rcu_read_unlock();
+  printk(KERN_INFO "Connecting to: %pISpc\n", uaddr);
   /* A dump_stack() here will give a stack backtrace */
+
   return 0;
 }
 
@@ -275,7 +409,62 @@ static int handler_fault(struct kprobe *p, struct pt_regs *regs, int trapnr)
   /* Return 0 because we don't handle the fault. */
   return 0;
 }
-static int __init kprobe_init(void)
+
+/* For each probe you need to allocate a kprobe structure */
+static struct kprobe kp = {
+  .pre_handler = handler_pre,
+  .symbol_name  = "inet_stream_connect",
+};
+
+
+/* per-instance private data */
+struct my_data {
+        ktime_t entry_stamp;
+};
+
+/* Here we use the entry_hanlder to timestamp function entry */
+static int entry_handler(struct kretprobe_instance *ri, struct pt_regs *regs)
+{
+        struct my_data *data;
+
+        if (!current->mm)
+                return 1;       /* Skip kernel threads */
+
+        data = (struct my_data *)ri->data;
+        data->entry_stamp = ktime_get();
+        return 0;
+}
+
+/*
+ * Return-probe handler: Log the return value and duration. Duration may turn
+ * out to be zero consistently, depending upon the granularity of time
+ * accounting on the platform.
+ */
+static int ret_handler(struct kretprobe_instance *ri, struct pt_regs *regs)
+{
+        int retval = regs_return_value(regs);
+        struct my_data *data = (struct my_data *)ri->data;
+        s64 delta;
+        ktime_t now;
+
+        now = ktime_get();
+        delta = ktime_to_ns(ktime_sub(now, data->entry_stamp));
+        printk(KERN_INFO "returned %d and took %lld ns to execute\n", retval, (long long)delta);
+        return 0;
+}
+
+static struct kretprobe my_kretprobe = {
+  .handler                = ret_handler,
+  .entry_handler          = entry_handler,
+  .data_size              = sizeof(struct my_data),
+  .maxactive              = 1024,
+  .kp = {
+    .symbol_name = "sys_connect",
+  },
+};
+
+
+static int __init minuteman_init(void)
 {
   int ret;
   ret = minuteman_nl_setup();
@@ -290,17 +479,24 @@ static int __init kprobe_init(void)
     return ret;
   }
   printk(KERN_INFO "Planted kprobe at %p\n", kp.addr);
+
+  ret = register_kretprobe(&my_kretprobe);
+  if (ret < 0) {
+                printk(KERN_INFO "register_kretprobe failed, returned %d\n",
+                                ret);
+  }
   return 0;
 }
 
-static void __exit kprobe_exit(void)
+static void __exit minuteman_exit(void)
 {
   unregister_kprobe(&kp);
   printk(KERN_INFO "kprobe at %p unregistered\n", kp.addr);
   minuteman_nl_unsetup();
+  unregister_kretprobe(&my_kretprobe);
 }
 
-module_init(kprobe_init)
-module_exit(kprobe_exit)
+module_init(minuteman_init)
+module_exit(minuteman_exit)
 MODULE_LICENSE("GPL");
 

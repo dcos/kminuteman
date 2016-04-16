@@ -56,10 +56,24 @@ int main() {
 
   nla_put_u32(msg, MINUTEMAN_ATTR_VIP_IP, addr.s_addr);
   nla_put_u16(msg, MINUTEMAN_ATTR_VIP_PORT, htons(1111));
-  nl_send_auto_complete(sk, msg);
+  nl_send_sync(sk, msg);
 
-  if ((err = nl_recvmsgs_default(sk)) < 0)
-                fprintf(stderr, "Unable to receive message: %s", nl_geterror(err));
+  if (!(msg = nlmsg_alloc()))
+    exit(1);
+
+  // Add the backend
+  hdr = genlmsg_put(msg, NL_AUTO_PORT, NL_AUTO_SEQ, family, 0, 0, MINUTEMAN_CMD_ADD_BE, 1);
+  if (!hdr)
+    exit(1);
+  inet_aton("1.2.3.4", &addr);
+
+  nla_put_u32(msg, MINUTEMAN_ATTR_VIP_IP, addr.s_addr);
+  nla_put_u16(msg, MINUTEMAN_ATTR_VIP_PORT, htons(1111));
+  inet_aton("33.33.33.1", &addr);
+  nla_put_u32(msg, MINUTEMAN_ATTR_BE_IP, addr.s_addr);
+  nla_put_u16(msg, MINUTEMAN_ATTR_BE_PORT, htons(1111));
+
+  nl_send_sync(sk, msg);
 
   ret = genl_send_simple(sk, family, MINUTEMAN_CMD_NOOP, 1, 0);
   printf("Status: %d\n", ret);
