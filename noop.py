@@ -19,4 +19,4 @@ MinutemanMessage = netlink.create_genl_message_type(
 )
 
 sock = netlink.NetlinkSocket()
-print sock.query(TaskstatsMessage('MINUTEMAN_CMD_NOOP', attr_list=AttrList()))
+print sock.query(MinutemanMessage('MINUTEMAN_CMD_NOOP'))

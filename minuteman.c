@@ -18,6 +18,9 @@
 
 #include "minuteman.h"
 
+// TODO: Initialize seed on startup
+#define SEED  42
+
 // For semi-awful reasons, we don't need to lock here because of genl_lock -- the only API here is the genl API
 // and all accesses are serialized :(
 #define VIP_HASH_BITS 3
@@ -28,23 +31,21 @@ static DEFINE_HASHTABLE(be_table, BE_HASH_BITS);
 
 static DEFINE_PER_CPU(__u32, minuteman_seqnum);
 
-struct ip_port {
-  __be32  ip;
-  __be16  port;
-};
 struct vip {
-  struct hlist_node hash_list;
-  struct list_head backend_containers;
-  struct ip_port  vip;
+  struct hlist_node   hash_list;
+  struct list_head    backend_containers;
+  struct sockaddr_in  vip;
+  struct rcu_head     rcu;
 };
 struct backend {
-  struct hlist_node hash_list;
-  struct ip_port  backend;
+  struct  hlist_node  hash_list;
+  struct  sockaddr_in backend;
   bool    available;
 };
 struct backend_container {
-  struct list_head list;
-  struct backend *backend;
+  struct list_head  list;
+  struct backend    *backend;
+  struct rcu_head   rcu;
 };
 
 static struct genl_family minuteman_family = {
@@ -55,9 +56,11 @@ static struct genl_family minuteman_family = {
   .maxattr = MINUTEMAN_ATTR_MAX,
 };
 
-static u64 hash_ip_port(__be32 ip, __be32 port) {
-  return (ip << 16) | port;
+static int hash_sockaddr(struct sockaddr_in *addr) {
+  // We don't support not AF_INET
+  return jhash(addr, sizeof(addr->sin_family) + sizeof(addr->sin_port) + sizeof(addr->sin_addr), SEED);
 }
+
 static int prepare_reply(struct genl_info *info, u8 cmd, struct sk_buff **skbp) {
         struct sk_buff *skb;
         void *reply;
@@ -97,12 +100,16 @@ static int send_reply(struct sk_buff *skb, struct genl_info *info)
 static int minuteman_nl_dump(struct sk_buff *skb, struct netlink_callback *cb) {
   return 0;
 }
-static int minuteman_nl_cmd_noop(struct sk_buff *skb, struct genl_info *info)
-{
+static int minuteman_nl_cmd_noop(struct sk_buff *skb, struct genl_info *info) {
   struct sk_buff *msg;
   void *hdr;
   int err;
+  struct vip *v;
+  int bkt;
 
+  hash_for_each_rcu(vip_table, bkt, v, hash_list) {
+    printk(KERN_INFO "Backend: %pISpc\n", &v->vip);
+  }
   printk(KERN_INFO "NOOPING\n");
 
   msg = nlmsg_new(NLMSG_DEFAULT_SIZE, GFP_KERNEL);
@@ -128,9 +135,9 @@ static int minuteman_nl_cmd_noop(struct sk_buff *skb, struct genl_info *info)
 static int minuteman_nl_cmd_add_vip(struct sk_buff *skb, struct genl_info *info) {
   int rc = 0;
   struct sk_buff *reply_skb;
-  __be32 ip;
-  __be16 port;
   struct vip *v;
+  int hash;
+  struct sockaddr_in addr;
 
   if (!info) return -EINVAL;
   if (!(info->attrs[MINUTEMAN_ATTR_VIP_IP])) {
@@ -139,33 +146,38 @@ static int minuteman_nl_cmd_add_vip(struct sk_buff *skb, struct genl_info *info)
   if (!(info->attrs[MINUTEMAN_ATTR_VIP_PORT])) {
     return -EINVAL;
   }
-  ip = nla_get_u32(info->attrs[MINUTEMAN_ATTR_VIP_IP]);
-  port = nla_get_u16(info->attrs[MINUTEMAN_ATTR_VIP_PORT]);
 
+  addr.sin_family = AF_INET;
+  addr.sin_addr.s_addr = nla_get_u32(info->attrs[MINUTEMAN_ATTR_VIP_IP]);
+  addr.sin_port = nla_get_u16(info->attrs[MINUTEMAN_ATTR_VIP_PORT]);
+  hash = hash_sockaddr(&addr);
+  // No need to RCU read lock here because we're the only ones writing
   // Check that we don't already have this VIP
-  hash_for_each_possible_rcu(vip_table, v, hash_list, hash_ip_port(ip, port)) {
-    if(v->vip.ip == ip && v->vip.port == port) {
-      return -EINVAL;
+  hash_for_each_possible_rcu(vip_table, v, hash_list, hash) {
+    if(v->vip.sin_family == AF_INET && v->vip.sin_addr.s_addr == ip && v->vip.sin_port == port) {
+      rc = -EINVAL;
+      goto fail;
     }
   }
 
   v = kmalloc(sizeof(*v), GFP_KERNEL);
-  if (!v)
-    return -ENOMEM;
+  if (!v) {
+    rc = -ENOMEM;
+    goto fail;
+  }
 
   INIT_LIST_HEAD(&v->backend_containers);
-  v->vip.ip = ip;
-  v->vip.port = port;
+  memcpy(&v->vip, &addr, sizeof(addr));
 
-  hash_add_rcu(vip_table, &v->hash_list, hash_ip_port(ip, port));
+  hash_add_rcu(vip_table, &v->hash_list, hash);
 
   rc = prepare_reply(info, MINUTEMAN_CMD_ADD_VIP, &reply_skb);
   if (rc < 0)
-    goto error;
+    goto fail;
 
   rc = send_reply(reply_skb, info);
 
-  error:
+  fail:
   return rc;
 }
 static int minuteman_nl_cmd_del_vip(struct sk_buff *skb, struct genl_info *info) {
@@ -173,6 +185,12 @@ static int minuteman_nl_cmd_del_vip(struct sk_buff *skb, struct genl_info *info)
 static int minuteman_nl_cmd_set_be(struct sk_buff *skb, struct genl_info *info) {
 }
 static int minuteman_nl_cmd_add_be(struct sk_buff *skb, struct genl_info *info) {
+  hash_for_each_possible_rcu(vip_table, v, hash_list, hash) {
+    if(v->vip.sin_family == AF_INET && v->vip.sin_addr.s_addr == ip && v->vip.sin_port == port) {
+      rc = -EINVAL;
+      goto fail;
+    }
+  }
 }
 static int minuteman_nl_cmd_del_be(struct sk_buff *skb, struct genl_info *info) {
 }
