@@ -1,4 +1,5 @@
 #include <linux/kernel.h>
+#include <linux/types.h>
 #include <linux/module.h>
 #include <linux/kprobes.h>
 #include <linux/socket.h>
