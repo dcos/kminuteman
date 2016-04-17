@@ -6,9 +6,6 @@
 #include <net/tcp.h>
 #include <linux/idr.h>
 #include <linux/net.h>
-#include <linux/utsname.h>
-#include <linux/filter.h>
-
 #include <uapi/linux/ip.h>
 #include <linux/netlink.h>
 #include <linux/rtnetlink.h>
@@ -25,31 +22,32 @@
 // For semi-awful reasons, we don't need to lock here because of genl_lock -- the only API here is the genl API
 // and all accesses are serialized :(
 #define VIP_HASH_BITS 8
-#define BE_HASH_BITS 16
+#define BE_HASH_BITS 8
 
 static DEFINE_HASHTABLE(vip_table, VIP_HASH_BITS);
 static DEFINE_HASHTABLE(be_table, BE_HASH_BITS);
 
 static DEFINE_PER_CPU(__u32, minuteman_seqnum);
 
-static struct vip {
+struct vip {
+	struct sockaddr_in vip; // The VIP itself
 	struct hlist_node hash_list;
-	int be_count;
-	backend_container backend_containers[];
-	struct sockaddr_in vip;
+	atomic_t backend_count;
+	struct list_head backend_containers;
 };
 
-static struct backend {
-	atomic_t refcnt;
-	struct hlist_node hash_list;
-	struct sockaddr_in backend;
-	bool available;
-};
-
-static struct backend_container {
-	struct list_head list;
+struct backend_container {
+  struct list_head list;
 	struct backend *backend;
 };
+
+struct backend {
+	struct sockaddr_in backend_addr;
+	struct hlist_node hash_list;
+	atomic_t refcnt;
+	int available;
+};
+
 
 static struct genl_family minuteman_family = {
 	.id = GENL_ID_GENERATE,
@@ -60,7 +58,7 @@ static struct genl_family minuteman_family = {
 };
 
 static int hash_sockaddr(struct sockaddr_in *addr) {
-	// We don't support not AF_INET
+	// We only support AF_INET
 	// Also, this only works because of the way the struct is laid out
 	// TODO: We should probably make this better
 	return jhash(addr, sizeof (addr->sin_family) + sizeof (addr->sin_port) + sizeof (addr->sin_addr), SEED);
@@ -87,7 +85,9 @@ static struct backend* get_be(struct sockaddr_in *addr) {
 	hash = hash_sockaddr(addr);
 
 	hash_for_each_possible_rcu(be_table, b, hash_list, hash) {
-		if (b->backend.sin_family == addr->sin_family && b->backend.sin_addr.s_addr == addr->sin_addr.s_addr && b->backend.sin_port == addr->sin_port) {
+		if (b->backend_addr.sin_family == addr->sin_family && 
+				b->backend_addr.sin_addr.s_addr == addr->sin_addr.s_addr && 
+				b->backend_addr.sin_port == addr->sin_port) {
 			return b;
 		}
 	}
@@ -137,23 +137,19 @@ static int minuteman_nl_cmd_noop(struct sk_buff *skb, struct genl_info *info) {
 	struct sk_buff *msg;
 	void *hdr;
 	int err;
-	struct vip *v;
+	struct vip *vip;
 	int bkt;
 	struct backend_container *be_container;
 	struct backend *be;
-
-	rcu_read_lock();
-
-	hash_for_each_rcu(vip_table, bkt, v, hash_list) {
-		printk(KERN_INFO "VIP: %pISpc\n", &v->vip);
-
-		list_for_each_entry_rcu(be_container, &v->backend_containers, list) {
-			be = rcu_dereference(be_container->backend);
-			printk(KERN_INFO "\tBackend: %pISpc\n", &be->backend);
+	
+	printk(KERN_INFO "NOOPING\n");
+	hash_for_each(vip_table, bkt, vip, hash_list) {
+		printk(KERN_INFO "VIP: %pISpc\n", &vip->vip);
+		list_for_each_entry(be_container, &vip->backend_containers, list) {
+			be = be_container->backend;
+			printk(KERN_INFO "\tBackend: %pISpc\n", &be->backend_addr);
 		}
 	}
-	rcu_read_unlock();
-	printk(KERN_INFO "NOOPING\n");
 
 	msg = nlmsg_new(NLMSG_DEFAULT_SIZE, GFP_KERNEL);
 	if (!msg)
@@ -207,9 +203,10 @@ static int minuteman_nl_cmd_add_vip(struct sk_buff *skb, struct genl_info *info)
 		goto fail;
 	}
 
-	INIT_LIST_HEAD(&v->backend_containers);
 	memcpy(&v->vip, &addr, sizeof (addr));
 
+	atomic_set(&v->backend_count, 0);
+	INIT_LIST_HEAD(&v->backend_containers);
 	hash_add_rcu(vip_table, &v->hash_list, hash);
 
 	rc = prepare_reply(info, MINUTEMAN_CMD_ADD_VIP, &reply_skb);
@@ -227,21 +224,8 @@ static int minuteman_nl_cmd_del_vip(struct sk_buff *skb, struct genl_info *info)
 
 static int minuteman_nl_cmd_set_be(struct sk_buff *skb, struct genl_info *info) {
 }
-
-static int minuteman_nl_cmd_add_be(struct sk_buff *skb, struct genl_info *info) {
-	int rc = 0;
-	struct sk_buff *reply_skb;
-	struct vip *v;
-	struct backend *be, *maybe_be;
-	struct backend_container *be_container;
-	int hash;
-	struct sockaddr_in be_addr, vip_addr;
-
-	if (!info) return -EINVAL;
-	if (!(info->attrs[MINUTEMAN_ATTR_VIP_IP])) {
-		return -EINVAL;
-	}
-	if (!(info->attrs[MINUTEMAN_ATTR_VIP_PORT])) {
+static int validate_minuteman_nl_cmd_add_be(struct genl_info *info) {
+	if (!info) {
 		return -EINVAL;
 	}
 	if (!(info->attrs[MINUTEMAN_ATTR_BE_IP])) {
@@ -250,68 +234,43 @@ static int minuteman_nl_cmd_add_be(struct sk_buff *skb, struct genl_info *info) 
 	if (!(info->attrs[MINUTEMAN_ATTR_BE_PORT])) {
 		return -EINVAL;
 	}
+	return 0;
+}
 
-	vip_addr.sin_family = AF_INET;
-	vip_addr.sin_addr.s_addr = nla_get_u32(info->attrs[MINUTEMAN_ATTR_VIP_IP]);
-	vip_addr.sin_port = nla_get_u16(info->attrs[MINUTEMAN_ATTR_VIP_PORT]);
+// We don't need to lock around this because all netlink operations are serialized
+static int minuteman_nl_cmd_add_be(struct sk_buff *skb, struct genl_info *info) {
+	int rc = 0;
+	struct sk_buff *reply_skb;
+	struct backend *be;
+	int hash;
+	struct sockaddr_in be_addr;
 
+	rc = validate_minuteman_nl_cmd_add_be(info);
+	if (rc != 0) {
+		return rc;
+	}
+	
 	be_addr.sin_family = AF_INET;
 	be_addr.sin_addr.s_addr = nla_get_u32(info->attrs[MINUTEMAN_ATTR_BE_IP]);
 	be_addr.sin_port = nla_get_u16(info->attrs[MINUTEMAN_ATTR_BE_PORT]);
-
-	rcu_read_lock();
-	v = get_vip(&vip_addr);
-	if (!v) {
-		rc = -EINVAL;
-		goto fail;
-	}
+	
 	// Now we check if the BE already exists
 	be = get_be(&be_addr);
 	if (be) {
-		// First check if the BE is already in the VIP
-
-		list_for_each_entry_rcu(be_container, &v->backend_containers, list) {
-			maybe_be = rcu_dereference(be_container->backend);
-			if (maybe_be == be) {
-				rc = -EINVAL;
-				goto fail;
-			}
-		}
-		be_container = kmalloc(sizeof (*be_container), GFP_KERNEL);
-		if (!be_container) {
-			rc = -ENOMEM;
-			goto fail;
-		}
-		rcu_read_unlock();
-		synchronize_rcu();
-		atomic_inc(&be->refcnt);
-	} else {
-		be_container = kmalloc(sizeof (*be_container), GFP_KERNEL);
-		if (!be_container) {
-			rc = -ENOMEM;
-			goto fail;
-		}
-
-		be = kmalloc(sizeof (*be), GFP_KERNEL);
-		if (!be) {
-			kfree(be_container);
-			rc = -ENOMEM;
-			goto fail;
-		}
-		rcu_read_unlock();
-
-		memcpy(&be->backend, &be_addr, sizeof (be_addr));
-		atomic_set(&be->refcnt, 1);
-		be->available = false;
-
-		hash = hash_sockaddr(&be_addr);
-		synchronize_rcu();
-		hash_add_rcu(be_table, &be->hash_list, hash);
+		rc = -EEXIST;
+		goto fail;
 	}
-
-	be_container->backend = be;
-	// We don't need to lock around this because all netlink operations are serialized
-	list_add_rcu(&be_container->list, &v->backend_containers);
+	be = kmalloc(sizeof (*be), GFP_KERNEL);
+	if (!be) {
+		rc = -ENOMEM;
+		goto fail;
+	}
+	memcpy(&be->backend_addr, &be_addr, sizeof (be_addr));
+	atomic_set(&be->refcnt, 1);
+	be->available = false;
+	hash = hash_sockaddr(&be_addr);
+	hash_add_rcu(be_table, &be->hash_list, hash);
+	
 
 	rc = prepare_reply(info, MINUTEMAN_CMD_ADD_BE, &reply_skb);
 	if (rc < 0)
@@ -319,16 +278,103 @@ static int minuteman_nl_cmd_add_be(struct sk_buff *skb, struct genl_info *info) 
 
 	rc = send_reply(reply_skb, info);
 
-	return rc;
-
 fail:
-	rcu_read_unlock();
 	return rc;
 }
 
 static int minuteman_nl_cmd_del_be(struct sk_buff *skb, struct genl_info *info) {
 }
 
+static int validate_minuteman_nl_cmd_attach_be(struct genl_info *info) {
+	int rc = 0;
+	if (!info) {
+		rc = -EINVAL;
+		goto end;
+	}
+	if (!(info->attrs[MINUTEMAN_ATTR_VIP_IP])) {
+		rc = -EINVAL;
+		goto end;
+	}
+	if (!(info->attrs[MINUTEMAN_ATTR_VIP_PORT])) {
+		rc = -EINVAL;
+		goto end;
+	}
+	if (!(info->attrs[MINUTEMAN_ATTR_BE_IP])) {
+		rc = -EINVAL;
+		goto end;
+	}
+	if (!(info->attrs[MINUTEMAN_ATTR_BE_PORT])) {
+		rc = -EINVAL;
+		goto end;
+	}
+	end:
+	return rc; 
+}
+static int minuteman_nl_cmd_attach_be(struct sk_buff *skb, struct genl_info *info) {
+	int rc = 0;
+	struct sk_buff *reply_skb;
+	struct vip *vip;
+	struct backend *be;
+	struct sockaddr_in be_addr, vip_addr;
+	struct backend_container *be_container;
+
+	rc = validate_minuteman_nl_cmd_attach_be(info);
+	if (rc != 0) {
+		goto fail;
+	}
+	
+	be_addr.sin_family = AF_INET;
+	be_addr.sin_addr.s_addr = nla_get_u32(info->attrs[MINUTEMAN_ATTR_BE_IP]);
+	be_addr.sin_port = nla_get_u16(info->attrs[MINUTEMAN_ATTR_BE_PORT]);
+	
+	vip_addr.sin_family = AF_INET;
+	vip_addr.sin_addr.s_addr = nla_get_u32(info->attrs[MINUTEMAN_ATTR_VIP_IP]);
+	vip_addr.sin_port = nla_get_u16(info->attrs[MINUTEMAN_ATTR_VIP_PORT]);
+	
+	
+	// Now we check if the BE already exists
+	be = get_be(&be_addr);
+	if (!be) {
+		rc = -ENONET;
+		goto fail;
+	}
+	vip = get_vip(&vip_addr);
+	if (!vip) {
+		rc = -ENONET;
+		goto fail;
+	}
+	list_for_each_entry(be_container, &vip->backend_containers, list) {
+			if (be == be_container->backend) {
+				rc = -EEXIST;
+				goto fail;
+			}
+	}
+
+	be_container = kmalloc(sizeof(struct backend_container), GFP_KERNEL);
+	if (be_container == NULL) {
+		rc = -ENOMEM;
+		goto fail;
+	}
+	be_container->backend = be;
+	
+	list_add_tail_rcu(&be_container->list, &vip->backend_containers);
+	// Not sure I need to do this?
+	synchronize_rcu();
+	atomic_inc(&vip->backend_count);
+	atomic_inc(&be->refcnt);
+	
+	rc = prepare_reply(info, MINUTEMAN_CMD_ATTACH_BE, &reply_skb);
+	
+	if (rc < 0)
+		return rc;
+
+	rc = send_reply(reply_skb, info);
+fail:
+	return rc;
+}
+
+static int minuteman_nl_cmd_detach_be(struct sk_buff *skb, struct genl_info *info) {
+}
 
 static const struct genl_ops minuteman_ops[] = {
 	{
@@ -351,12 +397,6 @@ static const struct genl_ops minuteman_ops[] = {
 		.policy = minuteman_policy,
 	},
 	{
-		.cmd = MINUTEMAN_CMD_SET_BE,
-		.flags = GENL_ADMIN_PERM,
-		.doit = minuteman_nl_cmd_set_be,
-		.policy = minuteman_policy,
-	},
-	{
 		.cmd = MINUTEMAN_CMD_ADD_BE,
 		.flags = GENL_ADMIN_PERM,
 		.doit = minuteman_nl_cmd_add_be,
@@ -366,6 +406,24 @@ static const struct genl_ops minuteman_ops[] = {
 		.cmd = MINUTEMAN_CMD_DEL_BE,
 		.flags = GENL_ADMIN_PERM,
 		.doit = minuteman_nl_cmd_del_be,
+		.policy = minuteman_policy,
+	},
+	{
+		.cmd = MINUTEMAN_CMD_SET_BE,
+		.flags = GENL_ADMIN_PERM,
+		.doit = minuteman_nl_cmd_set_be,
+		.policy = minuteman_policy,
+	},
+	{
+		.cmd = MINUTEMAN_CMD_ATTACH_BE,
+		.flags = GENL_ADMIN_PERM,
+		.doit = minuteman_nl_cmd_attach_be,
+		.policy = minuteman_policy,
+	},
+	{
+		.cmd = MINUTEMAN_CMD_DETACH_BE,
+		.flags = GENL_ADMIN_PERM,
+		.doit = minuteman_nl_cmd_detach_be,
 		.policy = minuteman_policy,
 	},
 };
@@ -405,10 +463,6 @@ static int handler_pre(struct kprobe *p, struct pt_regs *regs) {
 	return 0;
 }
 
-/* kprobe post_handler: called after the probed instruction is executed */
-static void handler_post(struct kprobe *p, struct pt_regs *regs, unsigned long flags) {
-}
-
 /*
  * fault_handler: this is called if an exception is generated for any
  * instruction within the pre- or post-handler, or when Kprobes
@@ -423,52 +477,8 @@ static int handler_fault(struct kprobe *p, struct pt_regs *regs, int trapnr) {
 /* For each probe you need to allocate a kprobe structure */
 static struct kprobe kp = {
 	.pre_handler = handler_pre,
+	.fault_handler = handler_fault,
 	.symbol_name = "inet_stream_connect",
-};
-
-/* per-instance private data */
-struct my_data {
-	ktime_t entry_stamp;
-};
-
-/* Here we use the entry_hanlder to timestamp function entry */
-static int entry_handler(struct kretprobe_instance *ri, struct pt_regs *regs) {
-	struct my_data *data;
-
-	if (!current->mm)
-		return 1; /* Skip kernel threads */
-
-	data = (struct my_data *) ri->data;
-	data->entry_stamp = ktime_get();
-	return 0;
-}
-
-/*
- * Return-probe handler: Log the return value and duration. Duration may turn
- * out to be zero consistently, depending upon the granularity of time
- * accounting on the platform.
- */
-static int ret_handler(struct kretprobe_instance *ri, struct pt_regs *regs) {
-	int retval = regs_return_value(regs);
-	struct my_data *data = (struct my_data *) ri->data;
-	s64 delta;
-	ktime_t now;
-
-	now = ktime_get();
-	delta = ktime_to_ns(ktime_sub(now, data->entry_stamp));
-	printk(KERN_INFO "returned %d and took %lld ns to execute\n", retval, (long long) delta);
-	return 0;
-}
-
-static struct kretprobe my_kretprobe = {
-	.handler = ret_handler,
-	.entry_handler = entry_handler,
-	.data_size = sizeof (struct my_data),
-	.maxactive = 1024,
-	.kp =
-	{
-		.symbol_name = "sys_connect",
-	},
 };
 
 static int __init minuteman_init(void) {
@@ -486,11 +496,6 @@ static int __init minuteman_init(void) {
 	}
 	printk(KERN_INFO "Planted kprobe at %p\n", kp.addr);
 
-	ret = register_kretprobe(&my_kretprobe);
-	if (ret < 0) {
-		printk(KERN_INFO "register_kretprobe failed, returned %d\n",
-					ret);
-	}
 	return 0;
 }
 
@@ -498,7 +503,6 @@ static void __exit minuteman_exit(void) {
 	unregister_kprobe(&kp);
 	printk(KERN_INFO "kprobe at %p unregistered\n", kp.addr);
 	minuteman_nl_unsetup();
-	unregister_kretprobe(&my_kretprobe);
 }
 
 module_init(minuteman_init)
