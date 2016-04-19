@@ -18,6 +18,7 @@
 
 // TODO: Initialize seed on startup
 #define SEED  42
+#define MAX_BACKENDS 1024
 
 // For semi-awful reasons, we don't need to lock here because of genl_lock -- the only API here is the genl API
 // and all accesses are serialized :(
@@ -27,18 +28,19 @@
 static DEFINE_HASHTABLE(vip_table, VIP_HASH_BITS);
 static DEFINE_HASHTABLE(be_table, BE_HASH_BITS);
 
-static DEFINE_PER_CPU(__u32, minuteman_seqnum);
 
+struct backend;
+struct backend_vector;
+struct vip;
+
+struct backend_vector {
+	long						backend_count;
+	struct backend	*backends[];
+};
 struct vip {
 	struct sockaddr_in vip; // The VIP itself
 	struct hlist_node hash_list;
-	atomic_t backend_count;
-	struct list_head backend_containers;
-};
-
-struct backend_container {
-  struct list_head list;
-	struct backend *backend;
+	struct backend_vector *be_vector;
 };
 
 struct backend {
@@ -46,6 +48,7 @@ struct backend {
 	struct hlist_node hash_list;
 	atomic_t refcnt;
 	int available;
+	int reachable;
 };
 
 
@@ -96,24 +99,18 @@ static struct backend* get_be(struct sockaddr_in *addr) {
 
 static int prepare_reply(struct genl_info *info, u8 cmd, struct sk_buff **skbp) {
 	struct sk_buff *skb;
-	void *reply;
+	void *hdr;
+	int err;
 
-	/*
-	 * If new attributes are added, please revisit this allocation
-	 */
-	skb = genlmsg_new(NLMSG_GOODSIZE, GFP_KERNEL);
+	skb = nlmsg_new(NLMSG_DEFAULT_SIZE, GFP_KERNEL);
 	if (!skb)
 		return -ENOMEM;
-
-	if (!info) {
-		int seq = this_cpu_inc_return(minuteman_seqnum) - 1;
-
-		reply = genlmsg_put(skb, 0, seq, &minuteman_family, 0, cmd);
-	} else
-		reply = genlmsg_put_reply(skb, info, &minuteman_family, 0, cmd);
-	if (reply == NULL) {
+	hdr = genlmsg_put(skb, info->snd_portid, info->snd_seq,
+										&minuteman_family, 0, cmd);
+	if (!hdr) {
+		err = -EMSGSIZE;
 		nlmsg_free(skb);
-		return -EINVAL;
+		return err;
 	}
 
 	*skbp = skb;
@@ -139,15 +136,19 @@ static int minuteman_nl_cmd_noop(struct sk_buff *skb, struct genl_info *info) {
 	int err;
 	struct vip *vip;
 	int bkt;
-	struct backend_container *be_container;
+	int i;
+	struct backend_vector *be_vector;
 	struct backend *be;
 	
 	printk(KERN_INFO "NOOPING\n");
 	hash_for_each(vip_table, bkt, vip, hash_list) {
 		printk(KERN_INFO "VIP: %pISpc\n", &vip->vip);
-		list_for_each_entry(be_container, &vip->backend_containers, list) {
-			be = be_container->backend;
-			printk(KERN_INFO "\tBackend: %pISpc\n", &be->backend_addr);
+		be_vector = rcu_dereference(vip->be_vector);
+		if (be_vector != NULL) {
+			for (i = 0; i < be_vector->backend_count; i++) {
+				be = be_vector->backends[i];
+				printk(KERN_INFO "\tBackend: %pISpc\n", &be->backend_addr);
+			}
 		}
 	}
 
@@ -193,7 +194,7 @@ static int minuteman_nl_cmd_add_vip(struct sk_buff *skb, struct genl_info *info)
 	// No need to RCU read lock here because we're the only ones writing
 	// Check that we don't already have this VIP
 	if (get_vip(&addr)) {
-		rc = -EINVAL;
+		rc = -EEXIST;
 		goto fail;
 	}
 
@@ -204,9 +205,7 @@ static int minuteman_nl_cmd_add_vip(struct sk_buff *skb, struct genl_info *info)
 	}
 
 	memcpy(&v->vip, &addr, sizeof (addr));
-
-	atomic_set(&v->backend_count, 0);
-	INIT_LIST_HEAD(&v->backend_containers);
+	v->be_vector = NULL;
 	hash_add_rcu(vip_table, &v->hash_list, hash);
 
 	rc = prepare_reply(info, MINUTEMAN_CMD_ADD_VIP, &reply_skb);
@@ -312,11 +311,13 @@ static int validate_minuteman_nl_cmd_attach_be(struct genl_info *info) {
 }
 static int minuteman_nl_cmd_attach_be(struct sk_buff *skb, struct genl_info *info) {
 	int rc = 0;
+	int i;
 	struct sk_buff *reply_skb;
 	struct vip *vip;
 	struct backend *be;
 	struct sockaddr_in be_addr, vip_addr;
-	struct backend_container *be_container;
+	struct backend_vector	*new_be_vector, *old_be_vector;
+	int new_backend_count;
 
 	rc = validate_minuteman_nl_cmd_attach_be(info);
 	if (rc != 0) {
@@ -343,24 +344,36 @@ static int minuteman_nl_cmd_attach_be(struct sk_buff *skb, struct genl_info *inf
 		rc = -ENONET;
 		goto fail;
 	}
-	list_for_each_entry(be_container, &vip->backend_containers, list) {
-			if (be == be_container->backend) {
+	old_be_vector = rcu_dereference(vip->be_vector);
+	if (old_be_vector == NULL) {
+		new_be_vector = kmalloc(sizeof(struct backend_vector) + sizeof(void*) * 1, GFP_KERNEL);
+		if (new_be_vector == NULL) {
+			rc = -ENOMEM;
+			goto fail;
+		}
+		new_be_vector->backend_count = 1;
+		new_be_vector->backends[0] = be;
+		rcu_assign_pointer(vip->be_vector, new_be_vector);
+	} else {
+		for(i = 0; i < old_be_vector->backend_count; i++) {
+			if (old_be_vector->backends[i] == be) {
 				rc = -EEXIST;
 				goto fail;
 			}
+		}
+		new_backend_count = old_be_vector->backend_count + 1;
+		new_be_vector = kmalloc(sizeof(struct backend_vector) + sizeof(void*) * new_backend_count, GFP_KERNEL);
+		if (new_be_vector == NULL) {
+			rc = -ENOMEM;
+			goto fail;
+		}
+		new_be_vector->backend_count = new_backend_count;
+		memcpy(&new_be_vector->backends, &old_be_vector->backends, sizeof(void*) * (old_be_vector->backend_count));
+		new_be_vector->backends[old_be_vector->backend_count] = be;
+		rcu_assign_pointer(vip->be_vector, new_be_vector);
+		synchronize_rcu();
+		kfree(old_be_vector);
 	}
-
-	be_container = kmalloc(sizeof(struct backend_container), GFP_KERNEL);
-	if (be_container == NULL) {
-		rc = -ENOMEM;
-		goto fail;
-	}
-	be_container->backend = be;
-	
-	list_add_tail_rcu(&be_container->list, &vip->backend_containers);
-	// Not sure I need to do this?
-	synchronize_rcu();
-	atomic_inc(&vip->backend_count);
 	atomic_inc(&be->refcnt);
 	
 	rc = prepare_reply(info, MINUTEMAN_CMD_ATTACH_BE, &reply_skb);
@@ -436,6 +449,34 @@ static int minuteman_nl_unsetup(void) {
 	return genl_unregister_family(&minuteman_family);
 }
 
+// Begins to return random numbers [0, maxnum) if idx > maxnum
+static int randomize_up_to(int idx, int maxnum) {
+	int i;
+	if (idx < maxnum) {
+		return idx;
+	} else {
+		get_random_bytes(&i, sizeof(i));
+		return i % maxnum;
+	}
+}
+// These array sizes are tiny for two reasons:
+	// 1. To encourage "mixing" 
+	// 2. To not blow up the stack
+
+// Calculate a backend based on the given sockaddr
+// Should happen in an rcu_read_lock
+static struct backend * get_backend(struct vip *vip) {
+	return NULL;
+}
+static void remap_backend(struct vip *vip, struct sockaddr_in *addr_in) {
+	struct backend *be = get_backend(vip);
+	if (be == NULL) {
+		// TODO: Then we must remap to some logical backend that traps the connection
+		return;
+	}
+		
+}
+
 /* kprobe pre_handler: called just before the probed instruction is executed */
 static int handler_pre(struct kprobe *p, struct pt_regs *regs) {
 	struct socket *sock;
@@ -453,7 +494,9 @@ static int handler_pre(struct kprobe *p, struct pt_regs *regs) {
 		addr_in = (struct sockaddr_in*) uaddr;
 		v = get_vip(addr_in);
 		if (v) {
-			printk(KERN_INFO "Raver\n");
+			// Marks the connection with 1024
+			sock->sk->sk_mark |= (1<<10);
+			remap_backend(v, addr_in);
 		}
 	}
 	rcu_read_unlock();
