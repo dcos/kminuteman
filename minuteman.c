@@ -156,7 +156,7 @@ static int minuteman_nl_cmd_noop(struct sk_buff *skb, struct genl_info *info) {
 	if (!msg)
 		return -ENOMEM;
 	hdr = genlmsg_put(msg, info->snd_portid, info->snd_seq,
-										&minuteman_family, 0, MINUTEMAN_CMD_NOOP);
+										&minuteman_family, NLM_F_ACK, MINUTEMAN_CMD_NOOP);
 	if (!hdr) {
 		err = -EMSGSIZE;
 		goto err_msg_put;
@@ -174,7 +174,6 @@ err_msg_put:
 
 static int minuteman_nl_cmd_add_vip(struct sk_buff *skb, struct genl_info *info) {
 	int rc = 0;
-	struct sk_buff *reply_skb;
 	struct vip *v;
 	int hash;
 	struct sockaddr_in addr;
@@ -207,13 +206,6 @@ static int minuteman_nl_cmd_add_vip(struct sk_buff *skb, struct genl_info *info)
 	memcpy(&v->vip, &addr, sizeof (addr));
 	v->be_vector = NULL;
 	hash_add_rcu(vip_table, &v->hash_list, hash);
-
-	rc = prepare_reply(info, MINUTEMAN_CMD_ADD_VIP, &reply_skb);
-	if (rc < 0)
-		goto fail;
-
-	rc = send_reply(reply_skb, info);
-
 fail:
 	return rc;
 }
@@ -270,13 +262,6 @@ static int minuteman_nl_cmd_add_be(struct sk_buff *skb, struct genl_info *info) 
 	hash = hash_sockaddr(&be_addr);
 	hash_add_rcu(be_table, &be->hash_list, hash);
 	
-
-	rc = prepare_reply(info, MINUTEMAN_CMD_ADD_BE, &reply_skb);
-	if (rc < 0)
-		return rc;
-
-	rc = send_reply(reply_skb, info);
-
 fail:
 	return rc;
 }
@@ -375,13 +360,6 @@ static int minuteman_nl_cmd_attach_be(struct sk_buff *skb, struct genl_info *inf
 		kfree(old_be_vector);
 	}
 	atomic_inc(&be->refcnt);
-	
-	rc = prepare_reply(info, MINUTEMAN_CMD_ATTACH_BE, &reply_skb);
-	
-	if (rc < 0)
-		return rc;
-
-	rc = send_reply(reply_skb, info);
 fail:
 	return rc;
 }
