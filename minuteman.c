@@ -14,6 +14,7 @@
 #include <linux/hashtable.h>
 #include <linux/seqlock.h>
 #include <linux/errno.h>
+#include <linux/fs.h>
 #include "minuteman.h"
 
 // TODO: Initialize seed on startup
@@ -47,8 +48,10 @@ struct backend {
 	struct sockaddr_in backend_addr;
 	struct hlist_node hash_list;
 	atomic_t refcnt;
-	int available;
-	int reachable;
+	atomic_t last_failure;
+	atomic_t consecutive_failures;
+	atomic_t total_successes;
+	atomic_t total_failures;
 };
 
 
@@ -131,9 +134,7 @@ static int minuteman_nl_dump(struct sk_buff *skb, struct netlink_callback *cb) {
 }
 
 static int minuteman_nl_cmd_noop(struct sk_buff *skb, struct genl_info *info) {
-	struct sk_buff *msg;
-	void *hdr;
-	int err;
+	int err = 0;
 	struct vip *vip;
 	int bkt;
 	int i;
@@ -151,23 +152,6 @@ static int minuteman_nl_cmd_noop(struct sk_buff *skb, struct genl_info *info) {
 			}
 		}
 	}
-
-	msg = nlmsg_new(NLMSG_DEFAULT_SIZE, GFP_KERNEL);
-	if (!msg)
-		return -ENOMEM;
-	hdr = genlmsg_put(msg, info->snd_portid, info->snd_seq,
-										&minuteman_family, NLM_F_ACK, MINUTEMAN_CMD_NOOP);
-	if (!hdr) {
-		err = -EMSGSIZE;
-		goto err_msg_put;
-	}
-
-	genlmsg_end(msg, hdr);
-
-	return genlmsg_unicast(genl_info_net(info), msg, info->snd_portid);
-
-err_msg_put:
-	nlmsg_free(msg);
 
 	return err;
 }
@@ -257,8 +241,8 @@ static int minuteman_nl_cmd_add_be(struct sk_buff *skb, struct genl_info *info) 
 		goto fail;
 	}
 	memcpy(&be->backend_addr, &be_addr, sizeof (be_addr));
-	atomic_set(&be->refcnt, 1);
-	be->available = false;
+	atomic_set(&be->refcnt, 0);
+	atomic_set(&be->consecutive_failures, 0);
 	hash = hash_sockaddr(&be_addr);
 	hash_add_rcu(be_table, &be->hash_list, hash);
 	
@@ -454,7 +438,40 @@ static void remap_backend(struct vip *vip, struct sockaddr_in *addr_in) {
 	}
 		
 }
+static int tcp_set_state_handler_pre(struct kprobe *p, struct pt_regs *regs) {
+	
+	struct sock *sk;
+	struct socket *sock;
+	int state;
+	state = (int)(regs->si);
+	sk = (struct sock*) (regs->di);
+	
+	if (!sk) {
+		return 0;
+	}
+	if (sk->sk_family != AF_INET) {
+		return 0;
+	}
+	
+	struct inet_sock *inet = inet_sk(sk);
 
+	sock = sk->sk_socket;
+	
+	int oldstate = sk->sk_state;
+	
+	if (!(state == TCP_SYN_SENT || state == TCP_ESTABLISHED || oldstate == TCP_ESTABLISHED)) {
+		return 0;
+	}
+	struct sockaddr_in addr;
+	addr.sin_family = AF_INET;
+	addr.sin_port = inet->inet_dport;
+	addr.sin_addr.s_addr = inet->inet_daddr;
+	
+	printk(KERN_INFO "Introspecting state change %pISpc - %d -> %d\n", &addr, oldstate, state);
+	
+	
+	return 0;
+}
 /* kprobe pre_handler: called just before the probed instruction is executed */
 static int handler_pre(struct kprobe *p, struct pt_regs *regs) {
 	struct socket *sock;
@@ -502,6 +519,12 @@ static struct kprobe kp = {
 	.symbol_name = "inet_stream_connect",
 };
 
+/* For each probe you need to allocate a kprobe structure */
+static struct kprobe tcp_set_state_kp = {
+	.pre_handler = tcp_set_state_handler_pre,
+	.fault_handler = handler_fault,
+	.symbol_name = "tcp_set_state",
+};
 static int __init minuteman_init(void) {
 	int ret;
 	ret = minuteman_nl_setup();
@@ -511,8 +534,16 @@ static int __init minuteman_init(void) {
 	}
 	ret = register_kprobe(&kp);
 	if (ret < 0) {
-		minuteman_nl_unsetup();
 		printk(KERN_INFO "register_kprobe failed, returned %d\n", ret);
+		minuteman_nl_unsetup();
+		return ret;
+	}
+	
+	ret = register_kprobe(&tcp_set_state_kp);
+	if (ret < 0) {
+		printk(KERN_INFO "register_kprobe failed, returned %d\n", ret);
+		unregister_kprobe(&kp);
+		minuteman_nl_unsetup();
 		return ret;
 	}
 	printk(KERN_INFO "Planted kprobe at %p\n", kp.addr);
@@ -523,6 +554,8 @@ static int __init minuteman_init(void) {
 static void __exit minuteman_exit(void) {
 	unregister_kprobe(&kp);
 	printk(KERN_INFO "kprobe at %p unregistered\n", kp.addr);
+	unregister_kprobe(&tcp_set_state_kp);
+	printk(KERN_INFO "kprobe at %p unregistered\n", tcp_set_state_kp.addr);
 	minuteman_nl_unsetup();
 }
 
