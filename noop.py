@@ -102,6 +102,10 @@ try:
 except Exception as e: print e
 
 try:
+  print sock.execute(MinutemanMessage('MINUTEMAN_CMD_SET_BE', attr_list=MinutemanAttrList(minuteman_attr_be_ip = be1_ip, minuteman_attr_be_port = be1_port, minuteman_attr_be_avail = 1)))
+except Exception as e: print e
+
+try:
   print sock.execute(MinutemanMessage('MINUTEMAN_CMD_ADD_BE', attr_list=MinutemanAttrList(minuteman_attr_be_ip = be2_ip, minuteman_attr_be_port = be2_port)))
 except Exception as e: print e
 

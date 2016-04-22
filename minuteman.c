@@ -338,8 +338,47 @@ fail:
 
 static int minuteman_nl_cmd_del_vip(struct sk_buff *skb, struct genl_info *info) {
 }
-
+static int validate_minuteman_nl_cmd_set_be(struct genl_info *info) {
+	if (!info) {
+		return -EINVAL;
+	}
+	if (!(info->attrs[MINUTEMAN_ATTR_BE_IP])) {
+		return -EINVAL;
+	}
+	if (!(info->attrs[MINUTEMAN_ATTR_BE_PORT])) {
+		return -EINVAL;
+	}
+	if (!(info->attrs[MINUTEMAN_ATTR_BE_REACH])) {
+		return -EINVAL;
+	}
+	return 0;
+}
 static int minuteman_nl_cmd_set_be(struct sk_buff *skb, struct genl_info *info) {
+	int rc = 0;
+	struct backend *be;
+	int hash;
+	struct sockaddr_in be_addr;
+
+	rc = validate_minuteman_nl_cmd_set_be(info);
+	if (rc != 0) {
+		return rc;
+	}
+	be_addr.sin_family = AF_INET;
+	be_addr.sin_addr.s_addr = nla_get_u32(info->attrs[MINUTEMAN_ATTR_BE_IP]);
+	be_addr.sin_port = nla_get_u16(info->attrs[MINUTEMAN_ATTR_BE_PORT]);
+	
+	rcu_read_lock();
+	// Now we check if the BE already exists
+	be = get_be(&be_addr);
+	if (!be) {
+		rc = -ENOENT;
+		goto fail;
+	}
+	atomic_set(&be->reachable, nla_get_u8(info->attrs[MINUTEMAN_ATTR_BE_REACH]));
+	
+	fail:
+	rcu_read_unlock();
+	return rc;
 }
 static int validate_minuteman_nl_cmd_add_be(struct genl_info *info) {
 	if (!info) {
