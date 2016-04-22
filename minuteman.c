@@ -131,36 +131,6 @@ static struct backend* get_be(struct sockaddr_in *addr) {
 	return NULL;
 }
 
-static int prepare_reply(struct genl_info *info, u8 cmd, struct sk_buff **skbp) {
-	struct sk_buff *skb;
-	void *hdr;
-	int err;
-
-	// 16MB
-	skb = nlmsg_new(1 << 16, GFP_KERNEL);
-	if (!skb)
-		return -ENOMEM;
-	hdr = genlmsg_put(skb, info->snd_portid, info->snd_seq,
-										&minuteman_family, 0, cmd);
-	if (!hdr) {
-		err = -EMSGSIZE;
-		nlmsg_free(skb);
-		return err;
-	}
-
-	*skbp = skb;
-	return 0;
-}
-
-static int send_reply(struct sk_buff *skb, struct genl_info *info) {
-	struct genlmsghdr *genlhdr = nlmsg_data(nlmsg_hdr(skb));
-	void *reply = genlmsg_data(genlhdr);
-
-	genlmsg_end(skb, reply);
-
-	return genlmsg_reply(skb, info);
-}
-
 static int minuteman_nl_fill_be(struct sk_buff *skb, struct backend *be) {
 	struct nlattr *nla;
 	int rc;
@@ -305,7 +275,6 @@ static int minuteman_nl_dump_noop(struct sk_buff *skb, struct netlink_callback *
 		cb->args[0] = vip_idx;
 		cb->args[1] = 0;
 	}
-	jump_out:
 	hash_for_each(be_table, bkt, be, hash_list) {
 		if (be_idx++ < cb->args[2])
 			continue;
@@ -314,81 +283,8 @@ static int minuteman_nl_dump_noop(struct sk_buff *skb, struct netlink_callback *
 			goto error;
 		}
 	}
-	
+	jump_out:
 	cb->args[2] = be_idx;
-	/*
-	hash_for_each_rcu(be_table, bkt, be, hash_list) {
-		rc = minuteman_nl_dump_be(skb, be, cb);
-		if (rc  < 0) {
-			goto error;
-		}
-	}
-	*/
-	/*
-	hash_for_each(vip_table, bkt, vip, hash_list) {
-		printk(KERN_INFO "VIP: %pISpc\n", &vip->vip);
-		be_vector = rcu_dereference(vip->be_vector);
-		vip_na = nla_nest_start(rep_skb, MINUTEMAN_ATTR_VIP);
-		if (!vip_na) {
-			rc = -EBADMSG;
-			goto error;
-		}
-		rc = nla_put_u32(rep_skb, MINUTEMAN_ATTR_VIP_IP, vip->vip.sin_addr.s_addr);
-		if (rc < 0) 
-			goto error;
-		rc = nla_put_u16(rep_skb, MINUTEMAN_ATTR_VIP_PORT, vip->vip.sin_port);
-		if (rc < 0) 
-			goto error;
-		
-		if (be_vector != NULL) {
-			for (i = 0; i < be_vector->backend_count; i++) {
-				be = be_vector->backends[i];
-				printk(KERN_INFO "\tBackend: %pISpc consecutive_failures: %d (last: %ld) pending: %d totals: failures: %d successes: %d\n", 
-							 &be->backend_addr, 
-							 atomic_read(&be->consecutive_failures),
-							 atomic64_read(&be->last_failure),
-							 atomic_read(&be->pending),
-							 atomic_read(&be->total_failures),
-							 atomic_read(&be->total_successes)
-							 
-						);
-				be_na = nla_nest_start(rep_skb, MINUTEMAN_ATTR_VIP_BE);
-				if (!be_na) {
-					rc = -ENOMEM;
-					goto error;
-				}
-				rc = nla_put_u32(rep_skb, MINUTEMAN_ATTR_BE_IP, be->backend_addr.sin_addr.s_addr);
-				if (rc < 0) 
-					goto error;
-				rc = nla_put_u16(rep_skb, MINUTEMAN_ATTR_BE_PORT, be->backend_addr.sin_port);
-				if (rc < 0) 
-					goto error;
-				rc = nla_put_u64(rep_skb, MINUTEMAN_ATTR_BE_CONSECUTIVE_FAILURES, atomic_read(&be->consecutive_failures));
-				if (rc < 0) 
-					goto error;
-				rc = nla_put_u64(rep_skb, MINUTEMAN_ATTR_BE_LAST_FAILURE, (unsigned long int)atomic_read(&be->consecutive_failures));
-				if (rc < 0) 
-					goto error;
-				rc = nla_put_u64(rep_skb, MINUTEMAN_ATTR_BE_CONSECUTIVE_FAILURES, atomic_read(&be->consecutive_failures));
-				if (rc < 0) 
-					goto error;
-				rc = nla_put_u64(rep_skb, MINUTEMAN_ATTR_BE_PENDING, atomic_read(&be->pending));
-				if (rc < 0) 
-					goto error;
-				rc = nla_put_u64(rep_skb, MINUTEMAN_ATTR_BE_TOTAL_FAILURES, atomic_read(&be->total_failures));
-				if (rc < 0) 
-					goto error;
-				rc = nla_put_u64(rep_skb, MINUTEMAN_ATTR_BE_TOTAL_SUCCESSES, atomic_read(&be->total_successes));
-				if (rc < 0) 
-					goto error;
-				nla_nest_end(rep_skb, be_na);
-			}
-		}
-		nla_nest_end(rep_skb, vip_na);
-	}
-
-	send_reply(rep_skb, info);
-	 * */
 	rcu_read_unlock();
 	return skb->len;
 	
