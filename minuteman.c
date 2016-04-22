@@ -261,7 +261,6 @@ static int minuteman_nl_dump_noop(struct sk_buff *skb, struct netlink_callback *
 		}
 		be_vector = vip->be_vector;
 		for (y = 0; y < be_vector->backend_count; y++) {
-			printk("Dumping BE %d, %d for VIP %d\n", x, y, vip_idx);
 			if (x++ < cb->args[1]) 
 				continue;
 			be = be_vector->backends[y];
