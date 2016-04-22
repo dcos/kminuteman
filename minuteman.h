@@ -1,3 +1,13 @@
+
+// Check some assertions
+#ifndef CONFIG_64BIT
+#error Compiles only on 64-bit
+#endif
+
+#ifndef CONFIG_X86_64
+#error CONFIG_X86_64
+#endif
+
 enum {
   MINUTEMAN_ATTR_UNSPEC,
   MINUTEMAN_ATTR_VIP_IP,

@@ -15,20 +15,41 @@
 #include <linux/seqlock.h>
 #include <linux/errno.h>
 #include <linux/fs.h>
+#include <net/route.h>
+
 #include "minuteman.h"
+
+#ifdef DEBUG
+# define DEBUG_PRINT(fmt, args...) printk()
+#else
+# define DEBUG_PRINT(fmt, args...) do {} while (0)
+#endif
+
+#define MIN(a,b) ((a)<(b) ? (a):(b))
+
+#define TCP_FAILED_THRESHOLD 5
+#define TCP_FAILED_BACKEND_BACKOFF_PERIOD 30
+#define TCP_FAILED_BACKEND_BACKOFF_PERIOD_JIFFIES TCP_FAILED_BACKEND_BACKOFF_PERIOD * HZ
 
 // TODO: Initialize seed on startup
 #define SEED  42
-#define MAX_BACKENDS 1024
+#define MAX_BACKENDS_PER_VIP 16384
 
 // For semi-awful reasons, we don't need to lock here because of genl_lock -- the only API here is the genl API
 // and all accesses are serialized :(
 #define VIP_HASH_BITS 8
 #define BE_HASH_BITS 8
 
+enum {
+	BACKEND_UP = 1,
+	BACKEND_MAYBE_UP,
+	BACKEND_DOWN
+};
+
 static DEFINE_HASHTABLE(vip_table, VIP_HASH_BITS);
 static DEFINE_HASHTABLE(be_table, BE_HASH_BITS);
 
+struct sockaddr_in blackhole;
 
 struct backend;
 struct backend_vector;
@@ -47,11 +68,21 @@ struct vip {
 struct backend {
 	struct sockaddr_in backend_addr;
 	struct hlist_node hash_list;
+	spinlock_t lock;
+	atomic_t reachable; // Did lashup decide it was reachable
 	atomic_t refcnt;
-	atomic_t last_failure;
+	atomic64_t last_failure;
 	atomic_t consecutive_failures;
 	atomic_t total_successes;
 	atomic_t total_failures;
+	atomic_t pending;
+};
+
+struct lb_scratch {
+	DECLARE_BITMAP(up_backends, MAX_BACKENDS_PER_VIP);
+	DECLARE_BITMAP(maybe_up_backends, MAX_BACKENDS_PER_VIP);
+	DECLARE_BITMAP(down_backends, MAX_BACKENDS_PER_VIP);
+
 };
 
 
@@ -148,7 +179,22 @@ static int minuteman_nl_cmd_noop(struct sk_buff *skb, struct genl_info *info) {
 		if (be_vector != NULL) {
 			for (i = 0; i < be_vector->backend_count; i++) {
 				be = be_vector->backends[i];
-				printk(KERN_INFO "\tBackend: %pISpc\n", &be->backend_addr);
+				/*
+				 	atomic_t last_failure;
+	atomic_t consecutive_failures;
+	atomic_t total_successes;
+	atomic_t total_failures;
+	atomic_t pending;
+				 */
+				printk(KERN_INFO "\tBackend: %pISpc consecutive_failures: %d (last: %ld) pending: %d totals: failures: %d successes: %d\n", 
+							 &be->backend_addr, 
+							 atomic_read(&be->consecutive_failures),
+							 atomic64_read(&be->last_failure),
+							 atomic_read(&be->pending),
+							 atomic_read(&be->total_failures),
+							 atomic_read(&be->total_successes)
+							 
+						);
 			}
 		}
 	}
@@ -243,6 +289,12 @@ static int minuteman_nl_cmd_add_be(struct sk_buff *skb, struct genl_info *info) 
 	memcpy(&be->backend_addr, &be_addr, sizeof (be_addr));
 	atomic_set(&be->refcnt, 0);
 	atomic_set(&be->consecutive_failures, 0);
+	atomic_set(&be->pending, 0);
+	atomic_set(&be->total_failures, 0);
+	atomic_set(&be->total_successes, 0);
+	atomic_set(&be->reachable, 0);
+	spin_lock_init(&be->lock);
+	
 	hash = hash_sockaddr(&be_addr);
 	hash_add_rcu(be_table, &be->hash_list, hash);
 	
@@ -411,30 +463,160 @@ static int minuteman_nl_unsetup(void) {
 	return genl_unregister_family(&minuteman_family);
 }
 
-// Begins to return random numbers [0, maxnum) if idx > maxnum
-static int randomize_up_to(int idx, int maxnum) {
-	int i;
-	if (idx < maxnum) {
-		return idx;
+// Although % doesn't result in "perfect" rnd, good enough
+static int rnd(unsigned int maxnum) {
+	unsigned int i;
+	get_random_bytes(&i, sizeof(i));
+	return i % maxnum;
+}
+
+// max_n = total number of set bits
+// bitsize = how big the bitset is
+static void choose_two(int bitsize, int max_n, const unsigned long *addr, int *ret1, int *ret2) {
+
+	int n1, n2, found_bits, tries, i, curbitidx;
+	tries = 0;
+	curbitidx = -1;
+	found_bits = 0;
+	printk(KERN_INFO "max_n: %d\n", max_n);
+
+	n1 = rnd(max_n);
+	printk(KERN_INFO "Got to choose 2\n");
+	printk(KERN_INFO "N1: %d\n", n1);
+	do {
+		n2 = rnd(max_n);
+		tries++;
+	} while (n1 == n2 && tries < 20);
+	printk(KERN_INFO "N2: %d\n", n2);
+	
+	for (i = 0; i < max_n; i++) {
+		curbitidx++;
+		curbitidx = find_next_bit(addr, max_n, curbitidx);
+		if (i == n1) {
+			*ret1 = curbitidx;
+		} 
+		if (i == n2) {
+			*ret2 = curbitidx;
+		}
+	}
+	printk("Chose %d, %d\n", *ret1, *ret2);
+}
+
+int is_open(struct backend *be) {
+	int reachable;
+	long long consecutive_failures;
+	long int last_failure;
+	reachable = atomic_read(&be->reachable);
+	spin_lock(&be->lock);
+	consecutive_failures = atomic_read(&be->consecutive_failures);
+	last_failure = atomic64_read(&be->last_failure);
+	spin_unlock(&be->lock);
+	printk("TCP_FAILED_BACKEND_BACKOFF_PERIOD_JIFFIES: %d\n", TCP_FAILED_BACKEND_BACKOFF_PERIOD_JIFFIES);
+	printk("Jiffies since last failure: %lu\n", ((signed long int)jiffies - last_failure));
+	printk("ConsFailures: %lld\n", consecutive_failures);
+	printk("TCP_FAILED_THRESHOLD: %d\n", TCP_FAILED_THRESHOLD);
+	printk("Jiffies: %lu\n", jiffies);
+	printk("Last failure: %lu\n", last_failure);
+
+	if ((consecutive_failures > TCP_FAILED_THRESHOLD) && (((signed long int)jiffies - last_failure) < TCP_FAILED_BACKEND_BACKOFF_PERIOD_JIFFIES)) {
+		return BACKEND_DOWN;
+	} else if (reachable == 1) {
+		return BACKEND_UP;
 	} else {
-		get_random_bytes(&i, sizeof(i));
-		return i % maxnum;
+		return BACKEND_MAYBE_UP; 
 	}
 }
-// These array sizes are tiny for two reasons:
-	// 1. To encourage "mixing" 
-	// 2. To not blow up the stack
 
-// Calculate a backend based on the given sockaddr
-// Should happen in an rcu_read_lock
-static struct backend * get_backend(struct vip *vip) {
-	return NULL;
+static int be_cost(struct backend *be) {
+	return atomic_read(&be->pending);
 }
-static void remap_backend(struct vip *vip, struct sockaddr_in *addr_in) {
-	struct backend *be = get_backend(vip);
+
+static struct backend * get_backend(struct lb_scratch *scratch_space, struct vip *vip) {
+	struct backend_vector *be_vector;
+	struct backend *be, *be1, *be2;
+	int i, state;
+	int total_backend_cnt;
+	
+	int n1 = 0;
+	int n2 = 0;
+
+	// Backends that haven't had recent failures and have been marked up by Lashup
+	int up_backends_cnt = 0;
+	// Backends that haven't had recent failures and have not been marked up by Lashup
+	int maybe_up_backends_cnt = 0;
+	// Down backends
+	int down_backends_cnt = 0;
+	
+	be_vector = vip->be_vector;
+	
+	total_backend_cnt = MIN(be_vector->backend_count, MAX_BACKENDS_PER_VIP);
+	if (total_backend_cnt == 0) {
+		return NULL;
+	} else if (total_backend_cnt == 1) {
+		return be_vector->backends[0];
+	}
+	bitmap_zero((long unsigned int *)&scratch_space->up_backends, MAX_BACKENDS_PER_VIP);
+	bitmap_zero((long unsigned int *)&scratch_space->maybe_up_backends, MAX_BACKENDS_PER_VIP);
+	bitmap_zero((long unsigned int *)&scratch_space->down_backends, MAX_BACKENDS_PER_VIP);
+	
+	
+	for (i = 0; i < total_backend_cnt; i++) {
+		be = be_vector->backends[i];
+		state = is_open(be);
+		printk(KERN_INFO "Backend (%pISpc) status: %d\n", &be->backend_addr, state);
+
+		if (state == BACKEND_DOWN) {
+			set_bit(i, (long unsigned int *)&scratch_space->down_backends);
+			down_backends_cnt++;
+		} else if (state == BACKEND_MAYBE_UP) {
+			set_bit(i, (long unsigned int *)&scratch_space->maybe_up_backends);
+			maybe_up_backends_cnt++;
+		} else if (state == BACKEND_UP) {
+			set_bit(i, (long unsigned int *)&scratch_space->up_backends);
+			up_backends_cnt++;
+		}
+	}
+	
+	// 1. Check up backends
+	// 2. Check maybe_up backends
+	// 3. Check other backends 
+	// 4. Check down backends
+	if (up_backends_cnt == 1) {
+		i = find_first_bit((const long unsigned int *)&scratch_space->up_backends, MAX_BACKENDS_PER_VIP);
+		return be_vector->backends[i];
+	} else if (up_backends_cnt > 0) {
+		choose_two(MAX_BACKENDS_PER_VIP, up_backends_cnt, (const long unsigned int *)&scratch_space->up_backends, &n1, &n2);
+	} else if (maybe_up_backends_cnt == 1) {
+		i = find_first_bit((const long unsigned int *)&scratch_space->maybe_up_backends, MAX_BACKENDS_PER_VIP);
+		return be_vector->backends[i];
+	} else if (maybe_up_backends_cnt > 0) {
+		choose_two(MAX_BACKENDS_PER_VIP, maybe_up_backends_cnt, (const long unsigned int *)&scratch_space->maybe_up_backends, &n1, &n2);
+	} else if (down_backends_cnt == 1) {
+		i = find_first_bit((const long unsigned int *)&scratch_space->down_backends, MAX_BACKENDS_PER_VIP);
+		return be_vector->backends[i];
+	} else if (down_backends_cnt > 0) {
+		choose_two(MAX_BACKENDS_PER_VIP, down_backends_cnt, (const long unsigned int *)&scratch_space->down_backends, &n1, &n2);
+	}
+	printk(KERN_INFO "Choosing between %d and %d\n", n1, n2);
+	be1 = be_vector->backends[n1];
+	be2 = be_vector->backends[n2];
+	be = (be_cost(be1) > be_cost(be2) ? be2 : be1);
+	return be;
+}
+
+// Something went wrong
+static void remap_backend_to_failure(struct vip *vip, struct sockaddr_in *addr_in) {
+	memcpy(addr_in, &blackhole, sizeof(blackhole));
+}
+static void remap_backend(struct lb_scratch *scratch_space, struct vip *vip, struct sockaddr_in *addr_in) {
+	struct backend *be = get_backend(scratch_space, vip);
 	if (be == NULL) {
+		printk(KERN_INFO "UNABLE TO MAP BACKEND\n");
+		remap_backend_to_failure(vip, addr_in);
+	} else {
 		// TODO: Then we must remap to some logical backend that traps the connection
-		return;
+		printk(KERN_INFO "Remapping connection to backend: %pISpc\n", &be->backend_addr);
+		memcpy(addr_in, &be->backend_addr, sizeof(struct sockaddr_in));
 	}
 		
 }
@@ -442,7 +624,11 @@ static int tcp_set_state_handler_pre(struct kprobe *p, struct pt_regs *regs) {
 	
 	struct sock *sk;
 	struct socket *sock;
-	int state;
+	struct inet_sock *inet;
+	int state, oldstate;
+	struct backend *be;
+	struct sockaddr_in addr;
+
 	state = (int)(regs->si);
 	sk = (struct sock*) (regs->di);
 	
@@ -453,32 +639,51 @@ static int tcp_set_state_handler_pre(struct kprobe *p, struct pt_regs *regs) {
 		return 0;
 	}
 	
-	struct inet_sock *inet = inet_sk(sk);
+	inet = inet_sk(sk);
 
 	sock = sk->sk_socket;
 	
-	int oldstate = sk->sk_state;
-	
-	if (!(state == TCP_SYN_SENT || state == TCP_ESTABLISHED || oldstate == TCP_ESTABLISHED)) {
-		return 0;
-	}
-	struct sockaddr_in addr;
+	oldstate = sk->sk_state;
 	addr.sin_family = AF_INET;
 	addr.sin_port = inet->inet_dport;
 	addr.sin_addr.s_addr = inet->inet_daddr;
 	
 	printk(KERN_INFO "Introspecting state change %pISpc - %d -> %d\n", &addr, oldstate, state);
-	
-	
+	if (state == oldstate) {
+		return 0;
+	}
+	be = get_be(&addr);
+	if (be) {
+		spin_lock(&be->lock);
+	}
+	rcu_read_unlock();
+	if (!be) {
+		return 0;
+	}
+	if (state == TCP_SYN_SENT) {
+		atomic_inc(&be->pending);
+	} else if (state == TCP_ESTABLISHED) {
+		atomic_dec(&be->pending);
+		atomic_set(&be->consecutive_failures, 0);
+		atomic_inc(&be->total_successes);
+	} else if ((oldstate == TCP_SYN_SENT || oldstate == TCP_SYN_RECV) && state == TCP_CLOSE) {
+		atomic_dec(&be->pending);
+		atomic_inc(&be->total_failures);
+		atomic_inc(&be->consecutive_failures);
+		atomic64_set(&be->last_failure, (signed long)jiffies);
+	}
+	spin_unlock(&be->lock);
 	return 0;
 }
 /* kprobe pre_handler: called just before the probed instruction is executed */
-static int handler_pre(struct kprobe *p, struct pt_regs *regs) {
+static int inet_stream_connect_handler_pre(struct kprobe *p, struct pt_regs *regs) {
 	struct socket *sock;
 	struct sockaddr *uaddr;
 	struct sockaddr_in *addr_in;
 	struct vip *v;
+	struct lb_scratch *scratch_space;
 	int addr_len;
+	
 
 	sock = (struct socket*) regs->di;
 	uaddr = (struct sockaddr*) regs->si;
@@ -489,9 +694,18 @@ static int handler_pre(struct kprobe *p, struct pt_regs *regs) {
 		addr_in = (struct sockaddr_in*) uaddr;
 		v = get_vip(addr_in);
 		if (v) {
+			// Maybe we should use a more clever allocator
+			// from my understanding kprobes are singletons
+			// so maybe we could make this part of the datastructure itself
+			scratch_space = kmalloc(sizeof(struct lb_scratch), GFP_KERNEL);
 			// Marks the connection with 1024
 			sock->sk->sk_mark |= (1<<10);
-			remap_backend(v, addr_in);
+			if (scratch_space != NULL) {
+				remap_backend(scratch_space, v, addr_in);
+				kfree(scratch_space);
+			} else {
+				remap_backend_to_failure(v, addr_in);
+			}
 		}
 	}
 	rcu_read_unlock();
@@ -507,14 +721,14 @@ static int handler_pre(struct kprobe *p, struct pt_regs *regs) {
  * single-steps the probed instruction.
  */
 static int handler_fault(struct kprobe *p, struct pt_regs *regs, int trapnr) {
-	printk(KERN_INFO "fault_handler: p->addr = 0x%p, trap #%dn", p->addr, trapnr);
+	printk(KERN_WARNING "fault_handler: p->addr = 0x%p, trap #%dn", p->addr, trapnr);
 	/* Return 0 because we don't handle the fault. */
 	return 0;
 }
 
 /* For each probe you need to allocate a kprobe structure */
 static struct kprobe kp = {
-	.pre_handler = handler_pre,
+	.pre_handler = inet_stream_connect_handler_pre,
 	.fault_handler = handler_fault,
 	.symbol_name = "inet_stream_connect",
 };
@@ -527,21 +741,26 @@ static struct kprobe tcp_set_state_kp = {
 };
 static int __init minuteman_init(void) {
 	int ret;
+	memset(&blackhole, 0, sizeof(blackhole));
+	
+	blackhole.sin_port = 0;
+	// 127.6.6.6
+	blackhole.sin_addr.s_addr = 0x7f060606;
 	ret = minuteman_nl_setup();
 	if (ret < 0) {
-		printk(KERN_INFO "minuteman_nl_setup failed, returned %d\n", ret);
+		printk(KERN_ERR "minuteman_nl_setup failed, returned %d\n", ret);
 		return ret;
 	}
 	ret = register_kprobe(&kp);
 	if (ret < 0) {
-		printk(KERN_INFO "register_kprobe failed, returned %d\n", ret);
+		printk(KERN_ERR "register_kprobe failed, returned %d\n", ret);
 		minuteman_nl_unsetup();
 		return ret;
 	}
 	
 	ret = register_kprobe(&tcp_set_state_kp);
 	if (ret < 0) {
-		printk(KERN_INFO "register_kprobe failed, returned %d\n", ret);
+		printk(KERN_ERR "register_kprobe failed, returned %d\n", ret);
 		unregister_kprobe(&kp);
 		minuteman_nl_unsetup();
 		return ret;
@@ -561,5 +780,5 @@ static void __exit minuteman_exit(void) {
 
 module_init(minuteman_init)
 module_exit(minuteman_exit)
-MODULE_LICENSE("GPL");
+MODULE_LICENSE("GPL and additional rights");
 
