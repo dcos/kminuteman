@@ -136,7 +136,8 @@ static int prepare_reply(struct genl_info *info, u8 cmd, struct sk_buff **skbp) 
 	void *hdr;
 	int err;
 
-	skb = nlmsg_new(NLMSG_DEFAULT_SIZE, GFP_KERNEL);
+	// 16MB
+	skb = nlmsg_new(1 << 16, GFP_KERNEL);
 	if (!skb)
 		return -ENOMEM;
 	hdr = genlmsg_put(skb, info->snd_portid, info->snd_seq,
@@ -160,33 +161,189 @@ static int send_reply(struct sk_buff *skb, struct genl_info *info) {
 	return genlmsg_reply(skb, info);
 }
 
-static int minuteman_nl_dump(struct sk_buff *skb, struct netlink_callback *cb) {
+static int minuteman_nl_fill_be(struct sk_buff *skb, struct backend *be) {
+	struct nlattr *nla;
+	int rc;
+	nla = nla_nest_start(skb, MINUTEMAN_ATTR_BE);
+	if (!nla)
+		return -EMSGSIZE;
+	rc = nla_put_u32(skb, MINUTEMAN_ATTR_BE_IP, be->backend_addr.sin_addr.s_addr);
+	if (rc < 0)
+		return rc;
+	rc = nla_put_u16(skb, MINUTEMAN_ATTR_BE_PORT, be->backend_addr.sin_port);
+	if (rc < 0)
+		return rc;
+	rc = nla_put_u64(skb, MINUTEMAN_ATTR_BE_CONSECUTIVE_FAILURES, atomic_read(&be->consecutive_failures));
+	if (rc < 0)
+		return rc;
+	rc = nla_put_u64(skb, MINUTEMAN_ATTR_BE_LAST_FAILURE, (unsigned long int) atomic_read(&be->consecutive_failures));
+	if (rc < 0)
+		return rc;
+	rc = nla_put_u64(skb, MINUTEMAN_ATTR_BE_CONSECUTIVE_FAILURES, atomic_read(&be->consecutive_failures));
+	if (rc < 0)
+		return rc;
+	rc = nla_put_u64(skb, MINUTEMAN_ATTR_BE_PENDING, atomic_read(&be->pending));
+	if (rc < 0)
+		return rc;
+	rc = nla_put_u64(skb, MINUTEMAN_ATTR_BE_TOTAL_FAILURES, atomic_read(&be->total_failures));
+	if (rc < 0)
+		return rc;
+	rc = nla_put_u64(skb, MINUTEMAN_ATTR_BE_TOTAL_SUCCESSES, atomic_read(&be->total_successes));
+	nla_nest_end(skb, nla);
 	return 0;
 }
+static int minuteman_nl_dump_be(struct sk_buff *skb, struct backend *be, struct netlink_callback *cb) {
+	void *hdr;
+	hdr = genlmsg_put(skb, NETLINK_CB(cb->skb).portid, cb->nlh->nlmsg_seq, &minuteman_family, NLM_F_MULTI, MINUTEMAN_CMD_NOOP);
+	if (minuteman_nl_fill_be(skb, be) < 0)
+		goto nla_put_failure;
 
-static int minuteman_nl_cmd_noop(struct sk_buff *skb, struct genl_info *info) {
-	int err = 0;
+	genlmsg_end(skb, hdr);
+	return 0;
+	nla_put_failure:
+		genlmsg_cancel(skb, hdr);
+		return -EMSGSIZE;
+}
+static int minuteman_nl_fill_vip_be(struct sk_buff *skb, struct vip *vip, struct backend *be) {
+	struct nlattr *nla;
+	int rc;
+	nla = nla_nest_start(skb, MINUTEMAN_ATTR_VIP_BE);
+	if (!nla)
+		return -EMSGSIZE;
+	rc = nla_put_u32(skb, MINUTEMAN_ATTR_VIP_IP, vip->vip.sin_addr.s_addr);
+	if (rc < 0) 
+		return rc;
+	rc = nla_put_u16(skb, MINUTEMAN_ATTR_VIP_PORT, vip->vip.sin_port);
+	if (rc < 0) 
+		return rc;
+	rc = nla_put_u32(skb, MINUTEMAN_ATTR_BE_IP, be->backend_addr.sin_addr.s_addr);
+	if (rc < 0)
+		return rc;
+	rc = nla_put_u16(skb, MINUTEMAN_ATTR_BE_PORT, be->backend_addr.sin_port);
+	if (rc < 0)
+		return rc;
+	nla_nest_end(skb, nla);
+	return 0;
+	
+}
+static int minuteman_nl_dump_vip_be(struct sk_buff *skb, struct vip *vip, struct backend *be, struct netlink_callback *cb) {
+	void *hdr;
+	hdr = genlmsg_put(skb, NETLINK_CB(cb->skb).portid, cb->nlh->nlmsg_seq, &minuteman_family, NLM_F_MULTI, MINUTEMAN_CMD_NOOP);
+	if (!hdr)
+		return -EMSGSIZE;
+	if (minuteman_nl_fill_vip_be(skb, vip, be) < 0)
+		goto nla_put_failure;
+
+	genlmsg_end(skb, hdr);
+	return 0;
+	nla_put_failure:
+		genlmsg_cancel(skb, hdr);
+		return -EMSGSIZE;
+}
+static int minuteman_nl_fill_vip(struct sk_buff *skb, struct vip *vip) {
+	struct nlattr *nla;
+	int rc;
+	nla = nla_nest_start(skb, MINUTEMAN_ATTR_VIP);
+	if (!nla)
+		return -EMSGSIZE;
+	rc = nla_put_u32(skb, MINUTEMAN_ATTR_VIP_IP, vip->vip.sin_addr.s_addr);
+	if (rc < 0) 
+		return rc;
+	rc = nla_put_u16(skb, MINUTEMAN_ATTR_VIP_PORT, vip->vip.sin_port);
+	if (rc < 0) 
+		return rc;
+	nla_nest_end(skb, nla);
+	return 0;
+}
+static int minuteman_nl_dump_vip(struct sk_buff *skb, struct vip *vip, struct netlink_callback *cb) {
+	void *hdr;
+	hdr = genlmsg_put(skb, NETLINK_CB(cb->skb).portid, cb->nlh->nlmsg_seq, &minuteman_family, NLM_F_MULTI, MINUTEMAN_CMD_NOOP);
+	if (!hdr)
+		return -EMSGSIZE;
+	if (minuteman_nl_fill_vip(skb, vip) < 0)
+		goto nla_put_failure;
+
+	genlmsg_end(skb, hdr);
+	return 0;
+	nla_put_failure:
+		genlmsg_cancel(skb, hdr);
+		return -EMSGSIZE;
+}
+static int minuteman_nl_dump_noop(struct sk_buff *skb, struct netlink_callback *cb) {
+	int rc = 0, x = 0, y;
 	struct vip *vip;
 	int bkt;
-	int i;
 	struct backend_vector *be_vector;
 	struct backend *be;
+	int vip_idx = 0, be_idx = 0;
+	rcu_read_lock();
 	
-	DEBUG_PRINT(KERN_INFO "NOOPING\n");
 	hash_for_each(vip_table, bkt, vip, hash_list) {
-		DEBUG_PRINT(KERN_INFO "VIP: %pISpc\n", &vip->vip);
+		if (vip_idx++ < cb->args[0])
+			continue;
+		
+		// Only dump on the first "go-around"
+		if (cb->args[1] == 0) {
+			rc = minuteman_nl_dump_vip(skb, vip, cb);
+			if (rc  < 0) {
+				goto error;
+			}
+		}
+		be_vector = vip->be_vector;
+		for (y = 0; y < be_vector->backend_count; y++) {
+			printk("Dumping BE %d, %d for VIP %d\n", x, y, vip_idx);
+			if (x++ < cb->args[1]) 
+				continue;
+			be = be_vector->backends[y];
+			rc = minuteman_nl_dump_vip_be(skb, vip, be, cb);
+			if (rc  < 0) {
+				goto error;
+			}
+			cb->args[1] = x;
+			goto jump_out;
+		}
+		cb->args[0] = vip_idx;
+		cb->args[1] = 0;
+	}
+	jump_out:
+	hash_for_each(be_table, bkt, be, hash_list) {
+		if (be_idx++ < cb->args[2])
+			continue;
+		rc = minuteman_nl_dump_be(skb, be, cb);
+		if (rc  < 0) {
+			goto error;
+		}
+	}
+	
+	cb->args[2] = be_idx;
+	/*
+	hash_for_each_rcu(be_table, bkt, be, hash_list) {
+		rc = minuteman_nl_dump_be(skb, be, cb);
+		if (rc  < 0) {
+			goto error;
+		}
+	}
+	*/
+	/*
+	hash_for_each(vip_table, bkt, vip, hash_list) {
+		printk(KERN_INFO "VIP: %pISpc\n", &vip->vip);
 		be_vector = rcu_dereference(vip->be_vector);
+		vip_na = nla_nest_start(rep_skb, MINUTEMAN_ATTR_VIP);
+		if (!vip_na) {
+			rc = -EBADMSG;
+			goto error;
+		}
+		rc = nla_put_u32(rep_skb, MINUTEMAN_ATTR_VIP_IP, vip->vip.sin_addr.s_addr);
+		if (rc < 0) 
+			goto error;
+		rc = nla_put_u16(rep_skb, MINUTEMAN_ATTR_VIP_PORT, vip->vip.sin_port);
+		if (rc < 0) 
+			goto error;
+		
 		if (be_vector != NULL) {
 			for (i = 0; i < be_vector->backend_count; i++) {
 				be = be_vector->backends[i];
-				/*
-				 	atomic_t last_failure;
-	atomic_t consecutive_failures;
-	atomic_t total_successes;
-	atomic_t total_failures;
-	atomic_t pending;
-				 */
-				DEBUG_PRINT(KERN_INFO "\tBackend: %pISpc consecutive_failures: %d (last: %ld) pending: %d totals: failures: %d successes: %d\n", 
+				printk(KERN_INFO "\tBackend: %pISpc consecutive_failures: %d (last: %ld) pending: %d totals: failures: %d successes: %d\n", 
 							 &be->backend_addr, 
 							 atomic_read(&be->consecutive_failures),
 							 atomic64_read(&be->last_failure),
@@ -195,19 +352,51 @@ static int minuteman_nl_cmd_noop(struct sk_buff *skb, struct genl_info *info) {
 							 atomic_read(&be->total_successes)
 							 
 						);
+				be_na = nla_nest_start(rep_skb, MINUTEMAN_ATTR_VIP_BE);
+				if (!be_na) {
+					rc = -ENOMEM;
+					goto error;
+				}
+				rc = nla_put_u32(rep_skb, MINUTEMAN_ATTR_BE_IP, be->backend_addr.sin_addr.s_addr);
+				if (rc < 0) 
+					goto error;
+				rc = nla_put_u16(rep_skb, MINUTEMAN_ATTR_BE_PORT, be->backend_addr.sin_port);
+				if (rc < 0) 
+					goto error;
+				rc = nla_put_u64(rep_skb, MINUTEMAN_ATTR_BE_CONSECUTIVE_FAILURES, atomic_read(&be->consecutive_failures));
+				if (rc < 0) 
+					goto error;
+				rc = nla_put_u64(rep_skb, MINUTEMAN_ATTR_BE_LAST_FAILURE, (unsigned long int)atomic_read(&be->consecutive_failures));
+				if (rc < 0) 
+					goto error;
+				rc = nla_put_u64(rep_skb, MINUTEMAN_ATTR_BE_CONSECUTIVE_FAILURES, atomic_read(&be->consecutive_failures));
+				if (rc < 0) 
+					goto error;
+				rc = nla_put_u64(rep_skb, MINUTEMAN_ATTR_BE_PENDING, atomic_read(&be->pending));
+				if (rc < 0) 
+					goto error;
+				rc = nla_put_u64(rep_skb, MINUTEMAN_ATTR_BE_TOTAL_FAILURES, atomic_read(&be->total_failures));
+				if (rc < 0) 
+					goto error;
+				rc = nla_put_u64(rep_skb, MINUTEMAN_ATTR_BE_TOTAL_SUCCESSES, atomic_read(&be->total_successes));
+				if (rc < 0) 
+					goto error;
+				nla_nest_end(rep_skb, be_na);
 			}
 		}
+		nla_nest_end(rep_skb, vip_na);
 	}
 
-	return err;
+	send_reply(rep_skb, info);
+	 * */
+	rcu_read_unlock();
+	return skb->len;
+	
+	error:
+	rcu_read_unlock();
+	return rc;
 }
-
-static int minuteman_nl_cmd_add_vip(struct sk_buff *skb, struct genl_info *info) {
-	int rc = 0;
-	struct vip *v;
-	int hash;
-	struct sockaddr_in addr;
-
+static int validate_minuteman_nl_cmd_add_vip(struct genl_info *info) { 
 	if (!info) return -EINVAL;
 	if (!(info->attrs[MINUTEMAN_ATTR_VIP_IP])) {
 		return -EINVAL;
@@ -215,7 +404,19 @@ static int minuteman_nl_cmd_add_vip(struct sk_buff *skb, struct genl_info *info)
 	if (!(info->attrs[MINUTEMAN_ATTR_VIP_PORT])) {
 		return -EINVAL;
 	}
+	return 0;
+}
+static int minuteman_nl_cmd_add_vip(struct sk_buff *skb, struct genl_info *info) {
+	int rc = 0;
+	struct vip *v;
+	int hash;
+	struct sockaddr_in addr;
 
+	rc = validate_minuteman_nl_cmd_add_vip(info);
+	if (rc != 0) {
+		return rc;
+	}
+	
 	addr.sin_family = AF_INET;
 	addr.sin_addr.s_addr = nla_get_u32(info->attrs[MINUTEMAN_ATTR_VIP_IP]);
 	addr.sin_port = nla_get_u16(info->attrs[MINUTEMAN_ATTR_VIP_PORT]);
@@ -261,7 +462,6 @@ static int validate_minuteman_nl_cmd_add_be(struct genl_info *info) {
 // We don't need to lock around this because all netlink operations are serialized
 static int minuteman_nl_cmd_add_be(struct sk_buff *skb, struct genl_info *info) {
 	int rc = 0;
-	struct sk_buff *reply_skb;
 	struct backend *be;
 	int hash;
 	struct sockaddr_in be_addr;
@@ -345,6 +545,7 @@ static int minuteman_nl_cmd_attach_be(struct sk_buff *skb, struct genl_info *inf
 		goto fail;
 	}
 	
+	
 	be_addr.sin_family = AF_INET;
 	be_addr.sin_addr.s_addr = nla_get_u32(info->attrs[MINUTEMAN_ATTR_BE_IP]);
 	be_addr.sin_port = nla_get_u16(info->attrs[MINUTEMAN_ATTR_BE_PORT]);
@@ -407,8 +608,7 @@ static const struct genl_ops minuteman_ops[] = {
 	{
 		.cmd = MINUTEMAN_CMD_NOOP,
 		.flags = GENL_ADMIN_PERM,
-		.doit = minuteman_nl_cmd_noop,
-		.dumpit = minuteman_nl_dump,
+		.dumpit = minuteman_nl_dump_noop,
 		.policy = minuteman_policy,
 	},
 	{
