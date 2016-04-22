@@ -20,7 +20,7 @@
 #include "minuteman.h"
 
 #ifdef DEBUG
-# define DEBUG_PRINT(fmt, args...) printk()
+# define DEBUG_PRINT(fmt, args...) DEBUG_PRINT()
 #else
 # define DEBUG_PRINT(fmt, args...) do {} while (0)
 #endif
@@ -172,9 +172,9 @@ static int minuteman_nl_cmd_noop(struct sk_buff *skb, struct genl_info *info) {
 	struct backend_vector *be_vector;
 	struct backend *be;
 	
-	printk(KERN_INFO "NOOPING\n");
+	DEBUG_PRINT(KERN_INFO "NOOPING\n");
 	hash_for_each(vip_table, bkt, vip, hash_list) {
-		printk(KERN_INFO "VIP: %pISpc\n", &vip->vip);
+		DEBUG_PRINT(KERN_INFO "VIP: %pISpc\n", &vip->vip);
 		be_vector = rcu_dereference(vip->be_vector);
 		if (be_vector != NULL) {
 			for (i = 0; i < be_vector->backend_count; i++) {
@@ -186,7 +186,7 @@ static int minuteman_nl_cmd_noop(struct sk_buff *skb, struct genl_info *info) {
 	atomic_t total_failures;
 	atomic_t pending;
 				 */
-				printk(KERN_INFO "\tBackend: %pISpc consecutive_failures: %d (last: %ld) pending: %d totals: failures: %d successes: %d\n", 
+				DEBUG_PRINT(KERN_INFO "\tBackend: %pISpc consecutive_failures: %d (last: %ld) pending: %d totals: failures: %d successes: %d\n", 
 							 &be->backend_addr, 
 							 atomic_read(&be->consecutive_failures),
 							 atomic64_read(&be->last_failure),
@@ -478,16 +478,16 @@ static void choose_two(int bitsize, int max_n, const unsigned long *addr, int *r
 	tries = 0;
 	curbitidx = -1;
 	found_bits = 0;
-	printk(KERN_INFO "max_n: %d\n", max_n);
+	DEBUG_PRINT(KERN_INFO "max_n: %d\n", max_n);
 
 	n1 = rnd(max_n);
-	printk(KERN_INFO "Got to choose 2\n");
-	printk(KERN_INFO "N1: %d\n", n1);
+	DEBUG_PRINT(KERN_INFO "Got to choose 2\n");
+	DEBUG_PRINT(KERN_INFO "N1: %d\n", n1);
 	do {
 		n2 = rnd(max_n);
 		tries++;
 	} while (n1 == n2 && tries < 20);
-	printk(KERN_INFO "N2: %d\n", n2);
+	DEBUG_PRINT(KERN_INFO "N2: %d\n", n2);
 	
 	for (i = 0; i < max_n; i++) {
 		curbitidx++;
@@ -499,7 +499,7 @@ static void choose_two(int bitsize, int max_n, const unsigned long *addr, int *r
 			*ret2 = curbitidx;
 		}
 	}
-	printk("Chose %d, %d\n", *ret1, *ret2);
+	DEBUG_PRINT("Chose %d, %d\n", *ret1, *ret2);
 }
 
 int is_open(struct backend *be) {
@@ -511,12 +511,12 @@ int is_open(struct backend *be) {
 	consecutive_failures = atomic_read(&be->consecutive_failures);
 	last_failure = atomic64_read(&be->last_failure);
 	spin_unlock(&be->lock);
-	printk("TCP_FAILED_BACKEND_BACKOFF_PERIOD_JIFFIES: %d\n", TCP_FAILED_BACKEND_BACKOFF_PERIOD_JIFFIES);
-	printk("Jiffies since last failure: %lu\n", ((signed long int)jiffies - last_failure));
-	printk("ConsFailures: %lld\n", consecutive_failures);
-	printk("TCP_FAILED_THRESHOLD: %d\n", TCP_FAILED_THRESHOLD);
-	printk("Jiffies: %lu\n", jiffies);
-	printk("Last failure: %lu\n", last_failure);
+	DEBUG_PRINT("TCP_FAILED_BACKEND_BACKOFF_PERIOD_JIFFIES: %d\n", TCP_FAILED_BACKEND_BACKOFF_PERIOD_JIFFIES);
+	DEBUG_PRINT("Jiffies since last failure: %lu\n", ((signed long int)jiffies - last_failure));
+	DEBUG_PRINT("ConsFailures: %lld\n", consecutive_failures);
+	DEBUG_PRINT("TCP_FAILED_THRESHOLD: %d\n", TCP_FAILED_THRESHOLD);
+	DEBUG_PRINT("Jiffies: %lu\n", jiffies);
+	DEBUG_PRINT("Last failure: %lu\n", last_failure);
 
 	if ((consecutive_failures > TCP_FAILED_THRESHOLD) && (((signed long int)jiffies - last_failure) < TCP_FAILED_BACKEND_BACKOFF_PERIOD_JIFFIES)) {
 		return BACKEND_DOWN;
@@ -563,7 +563,7 @@ static struct backend * get_backend(struct lb_scratch *scratch_space, struct vip
 	for (i = 0; i < total_backend_cnt; i++) {
 		be = be_vector->backends[i];
 		state = is_open(be);
-		printk(KERN_INFO "Backend (%pISpc) status: %d\n", &be->backend_addr, state);
+		DEBUG_PRINT(KERN_INFO "Backend (%pISpc) status: %d\n", &be->backend_addr, state);
 
 		if (state == BACKEND_DOWN) {
 			set_bit(i, (long unsigned int *)&scratch_space->down_backends);
@@ -597,7 +597,7 @@ static struct backend * get_backend(struct lb_scratch *scratch_space, struct vip
 	} else if (down_backends_cnt > 0) {
 		choose_two(MAX_BACKENDS_PER_VIP, down_backends_cnt, (const long unsigned int *)&scratch_space->down_backends, &n1, &n2);
 	}
-	printk(KERN_INFO "Choosing between %d and %d\n", n1, n2);
+	DEBUG_PRINT(KERN_INFO "Choosing between %d and %d\n", n1, n2);
 	be1 = be_vector->backends[n1];
 	be2 = be_vector->backends[n2];
 	be = (be_cost(be1) > be_cost(be2) ? be2 : be1);
@@ -611,11 +611,11 @@ static void remap_backend_to_failure(struct vip *vip, struct sockaddr_in *addr_i
 static void remap_backend(struct lb_scratch *scratch_space, struct vip *vip, struct sockaddr_in *addr_in) {
 	struct backend *be = get_backend(scratch_space, vip);
 	if (be == NULL) {
-		printk(KERN_INFO "UNABLE TO MAP BACKEND\n");
+		DEBUG_PRINT(KERN_INFO "UNABLE TO MAP BACKEND\n");
 		remap_backend_to_failure(vip, addr_in);
 	} else {
 		// TODO: Then we must remap to some logical backend that traps the connection
-		printk(KERN_INFO "Remapping connection to backend: %pISpc\n", &be->backend_addr);
+		DEBUG_PRINT(KERN_INFO "Remapping connection to backend: %pISpc\n", &be->backend_addr);
 		memcpy(addr_in, &be->backend_addr, sizeof(struct sockaddr_in));
 	}
 		
@@ -648,7 +648,7 @@ static int tcp_set_state_handler_pre(struct kprobe *p, struct pt_regs *regs) {
 	addr.sin_port = inet->inet_dport;
 	addr.sin_addr.s_addr = inet->inet_daddr;
 	
-	printk(KERN_INFO "Introspecting state change %pISpc - %d -> %d\n", &addr, oldstate, state);
+	DEBUG_PRINT(KERN_INFO "Introspecting state change %pISpc - %d -> %d\n", &addr, oldstate, state);
 	if (state == oldstate) {
 		return 0;
 	}
@@ -709,7 +709,7 @@ static int inet_stream_connect_handler_pre(struct kprobe *p, struct pt_regs *reg
 		}
 	}
 	rcu_read_unlock();
-	printk(KERN_INFO "Connecting to: %pISpc\n", uaddr);
+	DEBUG_PRINT(KERN_INFO "Connecting to: %pISpc\n", uaddr);
 	/* A dump_stack() here will give a stack backtrace */
 
 	return 0;
@@ -721,7 +721,7 @@ static int inet_stream_connect_handler_pre(struct kprobe *p, struct pt_regs *reg
  * single-steps the probed instruction.
  */
 static int handler_fault(struct kprobe *p, struct pt_regs *regs, int trapnr) {
-	printk(KERN_WARNING "fault_handler: p->addr = 0x%p, trap #%dn", p->addr, trapnr);
+	DEBUG_PRINT(KERN_WARNING "fault_handler: p->addr = 0x%p, trap #%dn", p->addr, trapnr);
 	/* Return 0 because we don't handle the fault. */
 	return 0;
 }
@@ -748,33 +748,33 @@ static int __init minuteman_init(void) {
 	blackhole.sin_addr.s_addr = 0x7f060606;
 	ret = minuteman_nl_setup();
 	if (ret < 0) {
-		printk(KERN_ERR "minuteman_nl_setup failed, returned %d\n", ret);
+		DEBUG_PRINT(KERN_ERR "minuteman_nl_setup failed, returned %d\n", ret);
 		return ret;
 	}
 	ret = register_kprobe(&kp);
 	if (ret < 0) {
-		printk(KERN_ERR "register_kprobe failed, returned %d\n", ret);
+		DEBUG_PRINT(KERN_ERR "register_kprobe failed, returned %d\n", ret);
 		minuteman_nl_unsetup();
 		return ret;
 	}
 	
 	ret = register_kprobe(&tcp_set_state_kp);
 	if (ret < 0) {
-		printk(KERN_ERR "register_kprobe failed, returned %d\n", ret);
+		DEBUG_PRINT(KERN_ERR "register_kprobe failed, returned %d\n", ret);
 		unregister_kprobe(&kp);
 		minuteman_nl_unsetup();
 		return ret;
 	}
-	printk(KERN_INFO "Planted kprobe at %p\n", kp.addr);
+	DEBUG_PRINT(KERN_INFO "Planted kprobe at %p\n", kp.addr);
 
 	return 0;
 }
 
 static void __exit minuteman_exit(void) {
 	unregister_kprobe(&kp);
-	printk(KERN_INFO "kprobe at %p unregistered\n", kp.addr);
+	DEBUG_PRINT(KERN_INFO "kprobe at %p unregistered\n", kp.addr);
 	unregister_kprobe(&tcp_set_state_kp);
-	printk(KERN_INFO "kprobe at %p unregistered\n", tcp_set_state_kp.addr);
+	DEBUG_PRINT(KERN_INFO "kprobe at %p unregistered\n", tcp_set_state_kp.addr);
 	minuteman_nl_unsetup();
 }
 
