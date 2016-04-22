@@ -473,21 +473,16 @@ static int rnd(unsigned int maxnum) {
 // max_n = total number of set bits
 // bitsize = how big the bitset is
 static void choose_two(int bitsize, int max_n, const unsigned long *addr, int *ret1, int *ret2) {
-
 	int n1, n2, found_bits, tries, i, curbitidx;
 	tries = 0;
 	curbitidx = -1;
 	found_bits = 0;
-	DEBUG_PRINT(KERN_INFO "max_n: %d\n", max_n);
 
 	n1 = rnd(max_n);
-	DEBUG_PRINT(KERN_INFO "Got to choose 2\n");
-	DEBUG_PRINT(KERN_INFO "N1: %d\n", n1);
 	do {
 		n2 = rnd(max_n);
 		tries++;
 	} while (n1 == n2 && tries < 20);
-	DEBUG_PRINT(KERN_INFO "N2: %d\n", n2);
 	
 	for (i = 0; i < max_n; i++) {
 		curbitidx++;
@@ -499,26 +494,20 @@ static void choose_two(int bitsize, int max_n, const unsigned long *addr, int *r
 			*ret2 = curbitidx;
 		}
 	}
-	DEBUG_PRINT("Chose %d, %d\n", *ret1, *ret2);
 }
 
 int is_open(struct backend *be) {
 	int reachable;
-	long long consecutive_failures;
+	int consecutive_failures;
 	long int last_failure;
 	reachable = atomic_read(&be->reachable);
 	spin_lock(&be->lock);
 	consecutive_failures = atomic_read(&be->consecutive_failures);
 	last_failure = atomic64_read(&be->last_failure);
 	spin_unlock(&be->lock);
-	DEBUG_PRINT("TCP_FAILED_BACKEND_BACKOFF_PERIOD_JIFFIES: %d\n", TCP_FAILED_BACKEND_BACKOFF_PERIOD_JIFFIES);
-	DEBUG_PRINT("Jiffies since last failure: %lu\n", ((signed long int)jiffies - last_failure));
-	DEBUG_PRINT("ConsFailures: %lld\n", consecutive_failures);
-	DEBUG_PRINT("TCP_FAILED_THRESHOLD: %d\n", TCP_FAILED_THRESHOLD);
-	DEBUG_PRINT("Jiffies: %lu\n", jiffies);
-	DEBUG_PRINT("Last failure: %lu\n", last_failure);
 
-	if ((consecutive_failures > TCP_FAILED_THRESHOLD) && (((signed long int)jiffies - last_failure) < TCP_FAILED_BACKEND_BACKOFF_PERIOD_JIFFIES)) {
+	if ((consecutive_failures > TCP_FAILED_THRESHOLD) && 
+		 (((signed long int)jiffies - last_failure) < TCP_FAILED_BACKEND_BACKOFF_PERIOD_JIFFIES)) {
 		return BACKEND_DOWN;
 	} else if (reachable == 1) {
 		return BACKEND_UP;
@@ -585,19 +574,21 @@ static struct backend * get_backend(struct lb_scratch *scratch_space, struct vip
 		i = find_first_bit((const long unsigned int *)&scratch_space->up_backends, MAX_BACKENDS_PER_VIP);
 		return be_vector->backends[i];
 	} else if (up_backends_cnt > 0) {
-		choose_two(MAX_BACKENDS_PER_VIP, up_backends_cnt, (const long unsigned int *)&scratch_space->up_backends, &n1, &n2);
+		choose_two(MAX_BACKENDS_PER_VIP, up_backends_cnt, 
+							 (const long unsigned int *)&scratch_space->up_backends, &n1, &n2);
 	} else if (maybe_up_backends_cnt == 1) {
 		i = find_first_bit((const long unsigned int *)&scratch_space->maybe_up_backends, MAX_BACKENDS_PER_VIP);
 		return be_vector->backends[i];
 	} else if (maybe_up_backends_cnt > 0) {
-		choose_two(MAX_BACKENDS_PER_VIP, maybe_up_backends_cnt, (const long unsigned int *)&scratch_space->maybe_up_backends, &n1, &n2);
+		choose_two(MAX_BACKENDS_PER_VIP, maybe_up_backends_cnt, 
+							 (const long unsigned int *)&scratch_space->maybe_up_backends, &n1, &n2);
 	} else if (down_backends_cnt == 1) {
 		i = find_first_bit((const long unsigned int *)&scratch_space->down_backends, MAX_BACKENDS_PER_VIP);
 		return be_vector->backends[i];
 	} else if (down_backends_cnt > 0) {
-		choose_two(MAX_BACKENDS_PER_VIP, down_backends_cnt, (const long unsigned int *)&scratch_space->down_backends, &n1, &n2);
+		choose_two(MAX_BACKENDS_PER_VIP, down_backends_cnt, 
+							 (const long unsigned int *)&scratch_space->down_backends, &n1, &n2);
 	}
-	DEBUG_PRINT(KERN_INFO "Choosing between %d and %d\n", n1, n2);
 	be1 = be_vector->backends[n1];
 	be2 = be_vector->backends[n2];
 	be = (be_cost(be1) > be_cost(be2) ? be2 : be1);
@@ -611,7 +602,7 @@ static void remap_backend_to_failure(struct vip *vip, struct sockaddr_in *addr_i
 static void remap_backend(struct lb_scratch *scratch_space, struct vip *vip, struct sockaddr_in *addr_in) {
 	struct backend *be = get_backend(scratch_space, vip);
 	if (be == NULL) {
-		DEBUG_PRINT(KERN_INFO "UNABLE TO MAP BACKEND\n");
+		printk(KERN_INFO "Unable to map backend\n");
 		remap_backend_to_failure(vip, addr_in);
 	} else {
 		// TODO: Then we must remap to some logical backend that traps the connection
@@ -748,33 +739,33 @@ static int __init minuteman_init(void) {
 	blackhole.sin_addr.s_addr = 0x7f060606;
 	ret = minuteman_nl_setup();
 	if (ret < 0) {
-		DEBUG_PRINT(KERN_ERR "minuteman_nl_setup failed, returned %d\n", ret);
+		printk(KERN_ERR "minuteman_nl_setup failed, returned %d\n", ret);
 		return ret;
 	}
 	ret = register_kprobe(&kp);
 	if (ret < 0) {
-		DEBUG_PRINT(KERN_ERR "register_kprobe failed, returned %d\n", ret);
+		printk(KERN_ERR "register_kprobe failed, returned %d\n", ret);
 		minuteman_nl_unsetup();
 		return ret;
 	}
 	
 	ret = register_kprobe(&tcp_set_state_kp);
 	if (ret < 0) {
-		DEBUG_PRINT(KERN_ERR "register_kprobe failed, returned %d\n", ret);
+		printk(KERN_ERR "register_kprobe failed, returned %d\n", ret);
 		unregister_kprobe(&kp);
 		minuteman_nl_unsetup();
 		return ret;
 	}
-	DEBUG_PRINT(KERN_INFO "Planted kprobe at %p\n", kp.addr);
+	printk(KERN_INFO "Planted kprobe at %p\n", kp.addr);
 
 	return 0;
 }
 
 static void __exit minuteman_exit(void) {
 	unregister_kprobe(&kp);
-	DEBUG_PRINT(KERN_INFO "kprobe at %p unregistered\n", kp.addr);
+	printk(KERN_INFO "kprobe at %p unregistered\n", kp.addr);
 	unregister_kprobe(&tcp_set_state_kp);
-	DEBUG_PRINT(KERN_INFO "kprobe at %p unregistered\n", tcp_set_state_kp.addr);
+	printk(KERN_INFO "kprobe at %p unregistered\n", tcp_set_state_kp.addr);
 	minuteman_nl_unsetup();
 }
 
