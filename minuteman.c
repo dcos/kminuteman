@@ -159,6 +159,11 @@ static int minuteman_nl_fill_be(struct sk_buff *skb, struct backend *be) {
 	if (rc < 0)
 		return rc;
 	rc = nla_put_u64(skb, MINUTEMAN_ATTR_BE_TOTAL_SUCCESSES, atomic_read(&be->total_successes));
+	if (rc < 0)
+		return rc;
+	rc = nla_put_u8(skb, MINUTEMAN_ATTR_BE_REACH, atomic_read(&be->reachable));
+	if (rc < 0)
+		return rc;
 	nla_nest_end(skb, nla);
 	return 0;
 }
@@ -304,6 +309,7 @@ static int validate_minuteman_nl_cmd_add_vip(struct genl_info *info) {
 static int minuteman_nl_cmd_add_vip(struct sk_buff *skb, struct genl_info *info) {
 	int rc = 0;
 	struct vip *v;
+	struct backend_vector *be_vector;
 	int hash;
 	struct sockaddr_in addr;
 
@@ -328,15 +334,64 @@ static int minuteman_nl_cmd_add_vip(struct sk_buff *skb, struct genl_info *info)
 		rc = -ENOMEM;
 		goto fail;
 	}
-
+	be_vector = kmalloc(sizeof(*be_vector), GFP_KERNEL);
+	if (!v) {
+		rc = -ENOMEM;
+		kfree(v);
+		goto fail;
+	}
+	
+	be_vector->backend_count = 0;
 	memcpy(&v->vip, &addr, sizeof (addr));
-	v->be_vector = NULL;
+	v->be_vector = be_vector;
 	hash_add_rcu(vip_table, &v->hash_list, hash);
 fail:
 	return rc;
 }
 
+static int validate_minuteman_nl_cmd_del_vip(struct genl_info *info) { 
+	if (!info) return -EINVAL;
+	if (!(info->attrs[MINUTEMAN_ATTR_VIP_IP])) {
+		return -EINVAL;
+	}
+	if (!(info->attrs[MINUTEMAN_ATTR_VIP_PORT])) {
+		return -EINVAL;
+	}
+	return 0;
+}
 static int minuteman_nl_cmd_del_vip(struct sk_buff *skb, struct genl_info *info) {
+	int rc = 0;
+	struct vip *v;
+	struct sockaddr_in addr;
+
+	rc = validate_minuteman_nl_cmd_del_vip(info);
+	if (rc != 0) {
+		return rc;
+	}
+	
+	addr.sin_family = AF_INET;
+	addr.sin_addr.s_addr = nla_get_u32(info->attrs[MINUTEMAN_ATTR_VIP_IP]);
+	addr.sin_port = nla_get_u16(info->attrs[MINUTEMAN_ATTR_VIP_PORT]);
+
+	rcu_read_lock();
+	v = get_vip(&addr);
+	if (!v) {
+		rc = -ENOENT;
+		goto fail;
+	}
+	rcu_read_unlock();
+
+	if (v->be_vector != NULL && v->be_vector->backend_count > 0) {
+		rc = -EBUSY;
+		goto fail;
+	}
+	hash_del_rcu(&v->hash_list);	
+	synchronize_rcu();
+	kfree(v->be_vector);
+	kfree(v);
+	
+fail:
+	return rc;
 }
 static int validate_minuteman_nl_cmd_set_be(struct genl_info *info) {
 	if (!info) {
@@ -356,7 +411,6 @@ static int validate_minuteman_nl_cmd_set_be(struct genl_info *info) {
 static int minuteman_nl_cmd_set_be(struct sk_buff *skb, struct genl_info *info) {
 	int rc = 0;
 	struct backend *be;
-	int hash;
 	struct sockaddr_in be_addr;
 
 	rc = validate_minuteman_nl_cmd_set_be(info);
@@ -431,12 +485,58 @@ static int minuteman_nl_cmd_add_be(struct sk_buff *skb, struct genl_info *info) 
 	
 	hash = hash_sockaddr(&be_addr);
 	hash_add_rcu(be_table, &be->hash_list, hash);
+	synchronize_rcu();
 	
 fail:
 	return rc;
 }
 
+
+static int validate_minuteman_nl_cmd_del_be(struct genl_info *info) {
+	if (!info) {
+		return -EINVAL;
+	}
+	if (!(info->attrs[MINUTEMAN_ATTR_BE_IP])) {
+		return -EINVAL;
+	}
+	if (!(info->attrs[MINUTEMAN_ATTR_BE_PORT])) {
+		return -EINVAL;
+	}
+	return 0;
+}
 static int minuteman_nl_cmd_del_be(struct sk_buff *skb, struct genl_info *info) {
+	int rc = 0;
+	struct backend *be;
+	struct sockaddr_in be_addr;
+
+	rc = validate_minuteman_nl_cmd_del_be(info);
+	if (rc != 0) {
+		return rc;
+	}
+	
+	be_addr.sin_family = AF_INET;
+	be_addr.sin_addr.s_addr = nla_get_u32(info->attrs[MINUTEMAN_ATTR_BE_IP]);
+	be_addr.sin_port = nla_get_u16(info->attrs[MINUTEMAN_ATTR_BE_PORT]);
+	
+	// Now we check if the BE already exists
+	rcu_read_lock();
+	be = get_be(&be_addr);
+	rcu_read_unlock();
+	if (!be) {
+		rc = -ENOENT;
+		goto fail;
+	}
+	if (atomic_read(&be->refcnt) != 0) {
+		rc = -EBUSY;
+		goto fail;
+	}
+	hash_del_rcu(&be->hash_list);
+	
+	synchronize_rcu();
+	kfree(be);
+	
+fail:
+	return rc;
 }
 
 static int validate_minuteman_nl_cmd_attach_be(struct genl_info *info) {
@@ -467,7 +567,6 @@ static int validate_minuteman_nl_cmd_attach_be(struct genl_info *info) {
 static int minuteman_nl_cmd_attach_be(struct sk_buff *skb, struct genl_info *info) {
 	int rc = 0;
 	int i;
-	struct sk_buff *reply_skb;
 	struct vip *vip;
 	struct backend *be;
 	struct sockaddr_in be_addr, vip_addr;
@@ -490,52 +589,146 @@ static int minuteman_nl_cmd_attach_be(struct sk_buff *skb, struct genl_info *inf
 	
 	
 	// Now we check if the BE already exists
+	rcu_read_lock();
 	be = get_be(&be_addr);
+	rcu_read_unlock();
 	if (!be) {
 		rc = -ENONET;
 		goto fail;
 	}
+	rcu_read_lock();
 	vip = get_vip(&vip_addr);
+	rcu_read_unlock();
 	if (!vip) {
 		rc = -ENONET;
 		goto fail;
 	}
 	old_be_vector = rcu_dereference(vip->be_vector);
-	if (old_be_vector == NULL) {
-		new_be_vector = kmalloc(sizeof(struct backend_vector) + sizeof(void*) * 1, GFP_KERNEL);
-		if (new_be_vector == NULL) {
-			rc = -ENOMEM;
+	for(i = 0; i < old_be_vector->backend_count; i++) {
+		if (old_be_vector->backends[i] == be) {
+			rc = -EEXIST;
 			goto fail;
 		}
-		new_be_vector->backend_count = 1;
-		new_be_vector->backends[0] = be;
-		rcu_assign_pointer(vip->be_vector, new_be_vector);
-	} else {
-		for(i = 0; i < old_be_vector->backend_count; i++) {
-			if (old_be_vector->backends[i] == be) {
-				rc = -EEXIST;
-				goto fail;
-			}
-		}
-		new_backend_count = old_be_vector->backend_count + 1;
-		new_be_vector = kmalloc(sizeof(struct backend_vector) + sizeof(void*) * new_backend_count, GFP_KERNEL);
-		if (new_be_vector == NULL) {
-			rc = -ENOMEM;
-			goto fail;
-		}
-		new_be_vector->backend_count = new_backend_count;
-		memcpy(&new_be_vector->backends, &old_be_vector->backends, sizeof(void*) * (old_be_vector->backend_count));
-		new_be_vector->backends[old_be_vector->backend_count] = be;
-		rcu_assign_pointer(vip->be_vector, new_be_vector);
-		synchronize_rcu();
-		kfree(old_be_vector);
 	}
+	
+	new_backend_count = old_be_vector->backend_count + 1;
+	new_be_vector = kmalloc(sizeof(struct backend_vector) + sizeof(void*) * new_backend_count, GFP_KERNEL);
+	if (new_be_vector == NULL) {
+		rc = -ENOMEM;
+		goto fail;
+	}
+	new_be_vector->backend_count = new_backend_count;
+	memcpy(&new_be_vector->backends, &old_be_vector->backends, sizeof(void*) * (old_be_vector->backend_count));
+	new_be_vector->backends[old_be_vector->backend_count] = be;
+	rcu_assign_pointer(vip->be_vector, new_be_vector);
+	synchronize_rcu();
+	kfree(old_be_vector);
 	atomic_inc(&be->refcnt);
 fail:
 	return rc;
 }
 
+static int validate_minuteman_nl_cmd_detach_be(struct genl_info *info) {
+	int rc = 0;
+	if (!info) {
+		rc = -EINVAL;
+		goto end;
+	}
+	if (!(info->attrs[MINUTEMAN_ATTR_VIP_IP])) {
+		rc = -EINVAL;
+		goto end;
+	}
+	if (!(info->attrs[MINUTEMAN_ATTR_VIP_PORT])) {
+		rc = -EINVAL;
+		goto end;
+	}
+	if (!(info->attrs[MINUTEMAN_ATTR_BE_IP])) {
+		rc = -EINVAL;
+		goto end;
+	}
+	if (!(info->attrs[MINUTEMAN_ATTR_BE_PORT])) {
+		rc = -EINVAL;
+		goto end;
+	}
+	end:
+	return rc; 
+}
+
 static int minuteman_nl_cmd_detach_be(struct sk_buff *skb, struct genl_info *info) {
+	int rc = 0;
+	int i = 0, x= 0;
+	struct vip *vip;
+	struct backend *be;
+	struct sockaddr_in be_addr, vip_addr;
+	struct backend_vector	*new_be_vector, *old_be_vector;
+	int new_backend_count, found;
+
+	rc = validate_minuteman_nl_cmd_detach_be(info);
+	if (rc != 0) {
+		goto fail;
+	}
+	
+	
+	be_addr.sin_family = AF_INET;
+	be_addr.sin_addr.s_addr = nla_get_u32(info->attrs[MINUTEMAN_ATTR_BE_IP]);
+	be_addr.sin_port = nla_get_u16(info->attrs[MINUTEMAN_ATTR_BE_PORT]);
+	
+	vip_addr.sin_family = AF_INET;
+	vip_addr.sin_addr.s_addr = nla_get_u32(info->attrs[MINUTEMAN_ATTR_VIP_IP]);
+	vip_addr.sin_port = nla_get_u16(info->attrs[MINUTEMAN_ATTR_VIP_PORT]);
+	
+	
+	// Now we check if the BE already exists
+	rcu_read_lock();
+	be = get_be(&be_addr);
+	rcu_read_unlock();
+
+	if (!be) {
+		rc = -ENONET;
+		goto fail;
+	}
+	rcu_read_lock();
+	vip = get_vip(&vip_addr);
+	rcu_read_unlock();
+	if (!vip) {
+		rc = -ENONET;
+		goto fail;
+	}
+	
+	
+	old_be_vector = rcu_dereference(vip->be_vector);
+	found = 0;
+	for(i = 0; i < old_be_vector->backend_count; i++) {
+		if (old_be_vector->backends[i] == be) {
+			found = 1;
+			break;
+		}
+	}
+	if (found == 0) {
+		rc = -ENOENT;
+		goto fail;
+	}
+	
+	new_backend_count = old_be_vector->backend_count - 1;
+	new_be_vector = kmalloc(sizeof(struct backend_vector) + sizeof(void*) * new_backend_count, GFP_KERNEL);
+	if (new_be_vector == NULL) {
+		rc = -ENOMEM;
+		goto fail;
+	}
+	new_be_vector->backend_count = new_backend_count;
+	for (i = 0; i < old_be_vector->backend_count; i++) {
+		if (old_be_vector->backends[i] == be) 
+			continue;
+		new_be_vector->backends[x] = old_be_vector->backends[i];
+		x++;
+	}
+	
+	rcu_assign_pointer(vip->be_vector, new_be_vector);
+	synchronize_rcu();
+	kfree(old_be_vector);
+	atomic_dec(&be->refcnt);
+fail:
+	return rc;
 }
 
 static const struct genl_ops minuteman_ops[] = {
